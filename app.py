@@ -1,711 +1,1232 @@
 import os
-import time
-import logging
-import secrets
-from typing import Optional
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("fixed-risk-booster")
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+APP_VERSION = "3.0.0-fixed-risk"
+
+# Your Vercel frontend
+FRONTEND_ORIGIN = os.getenv(
+    "FRONTEND_ORIGIN",
+    "*"
+)
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
 
 app = FastAPI(
     title="Fixed Risk Booster API",
-    version="3.0.0"
+    version=APP_VERSION,
+    description=(
+        "Backend for Fixed Risk Booster. "
+        "Demo and real-account state are isolated."
+    )
 )
 
-# ---------------------------------------------------------
+
+# ============================================================
 # CORS
-# ---------------------------------------------------------
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=(
+        ["*"]
+        if FRONTEND_ORIGIN == "*"
+        else [FRONTEND_ORIGIN]
+    ),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# IN-MEMORY SESSIONS
-# ---------------------------------------------------------
 
-USER_SESSIONS = {}
+# ============================================================
+# IN-MEMORY STORAGE
+#
+# This is intentionally the first backend stage.
+#
+# IMPORTANT:
+# Render instance memory is NOT permanent storage.
+# Later we will move account/trade history into a database.
+# ============================================================
 
-DEFAULT_DEMO_BALANCE = 10000.00
+USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
-# ---------------------------------------------------------
+# ============================================================
 # MODELS
-# ---------------------------------------------------------
+# ============================================================
 
-class SessionAuthRequest(BaseModel):
-    user_id: str
-    ssid: str
-
-
-class TradeExecutionRequest(BaseModel):
-    user_id: str
-    asset: str
-    amount: float = Field(gt=0)
-    direction: str
-    duration: int = Field(default=60, ge=5, le=3600)
-    is_demo: bool = True
+class SessionRegisterRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
 
 
-class BalanceRequest(BaseModel):
-    user_id: str
-    is_demo: bool = True
+class TradingStartRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
 
-
-# ---------------------------------------------------------
-# BASIC MARKET INFORMATION
-# ---------------------------------------------------------
-
-def calculate_favorable_market():
-    """
-    This is still the existing placeholder market-analysis
-    logic from the previous backend.
-
-    IMPORTANT:
-    These numbers are NOT claimed to be live AI predictions.
-    """
-
-    markets = [
-        {
-            "asset": "EURUSD_otc",
-            "payout": 92,
-            "rsi": 28.4,
-            "signal": "BULLISH",
-            "direction": "CALL",
-        },
-        {
-            "asset": "GBPUSD_otc",
-            "payout": 88,
-            "rsi": 52.1,
-            "signal": "HOLD",
-            "direction": None,
-        },
-        {
-            "asset": "USDJPY_otc",
-            "payout": 85,
-            "rsi": 74.8,
-            "signal": "BEARISH",
-            "direction": "PUT",
-        },
-        {
-            "asset": "BTCUSD",
-            "payout": 80,
-            "rsi": 31.2,
-            "signal": "BULLISH",
-            "direction": "CALL",
-        },
-    ]
-
-    actionable = [
-        m for m in markets
-        if m["direction"] is not None
-    ]
-
-    best = max(
-        actionable,
-        key=lambda x: x["payout"]
+    account: str = Field(
+        default="demo"
     )
 
-    return {
-        "recommended_asset": best["asset"],
-        "payout": f'{best["payout"]}%',
-        "predicted_direction": best["direction"],
-        "confidence_score": 89.2,
-        "rsi_value": best["rsi"],
-        "reason": (
-            f'RSI indicates '
-            f'{"oversold" if best["rsi"] < 30 else "overbought" if best["rsi"] > 70 else "neutral"} '
-            f'conditions ({best["rsi"]}) with high payout.'
-        )
-    }
-
-
-# ---------------------------------------------------------
-# POCKET OPTION CLIENT
-# ---------------------------------------------------------
-
-def load_pocket_client():
-    """
-    Loads the Pocket Option client already used by the project.
-
-    We deliberately do NOT silently create a fake client.
-    """
-
-    try:
-        from pocketoptionapi_async import (
-            AsyncPocketOptionClient,
-            OrderDirection
-        )
-
-        return AsyncPocketOptionClient, OrderDirection
-
-    except ImportError as exc:
-        logger.error(
-            "pocketoptionapi_async is not installed: %s",
-            exc
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Pocket Option connector is not installed on the "
-                "backend."
-            )
-        )
-
-
-async def create_connected_client(ssid: str):
-    """
-    Creates a real Pocket Option connection.
-
-    The exact SSID/session format must be supplied by the
-    supported Pocket Option connector being used by the server.
-    """
-
-    if not ssid:
-        raise HTTPException(
-            status_code=400,
-            detail="No Pocket Option session token supplied."
-        )
-
-    if not ssid.startswith('42["auth"'):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Pocket Option session token format."
-        )
-
-    AsyncPocketOptionClient, _ = load_pocket_client()
-
-    client = AsyncPocketOptionClient(ssid)
-
-    try:
-        await client.connect()
-
-    except Exception as exc:
-        logger.exception(
-            "Pocket Option connection failed"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Pocket Option connection failed. "
-                "No real-account balance was returned."
-            )
-        ) from exc
-
-    return client
-
-
-# ---------------------------------------------------------
-# ROOT
-# ---------------------------------------------------------
-
-@app.get("/")
-@app.head("/")
-@app.options("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "Fixed Risk Booster API",
-        "version": "3.0.0"
-    }
-
-
-# ---------------------------------------------------------
-# HEALTH
-# ---------------------------------------------------------
-
-@app.get("/api/health")
-async def health():
-    return {
-        "status": "healthy",
-        "service": "fixed-risk-booster"
-    }
-
-
-# ---------------------------------------------------------
-# MARKET PREDICTION
-# ---------------------------------------------------------
-
-@app.get("/api/market/prediction")
-async def market_prediction():
-
-    return calculate_favorable_market()
-
-
-# ---------------------------------------------------------
-# REGISTER / CONNECT POCKET OPTION SESSION
-# ---------------------------------------------------------
-
-@app.post("/api/session/register")
-async def register_session(request: SessionAuthRequest):
-
-    user_id = request.user_id.strip()
-    ssid = request.ssid.strip()
-
-    if not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing user_id."
-        )
-
-    if not ssid.startswith('42["auth"'):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Pocket Option session token."
-        )
-
-    # Try to connect to the actual broker.
-    client = await create_connected_client(ssid)
-
-    # IMPORTANT:
-    # We only call the session connected when the actual
-    # Pocket Option connection succeeds.
-    try:
-        balance = await client.get_balance()
-
-    except Exception as exc:
-        logger.exception(
-            "Unable to retrieve Pocket Option balance."
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Pocket Option connected, but the real balance "
-                "could not be retrieved."
-            )
-        ) from exc
-
-    # Normalize the returned balance.
-    try:
-        real_balance = float(balance)
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=502,
-            detail="Pocket Option returned an invalid balance."
-        )
-
-    session_id = secrets.token_urlsafe(32)
-
-    USER_SESSIONS[user_id] = {
-        "session_id": session_id,
-        "ssid": ssid,
-        "client": client,
-        "connected": True,
-        "connected_at": time.time(),
-
-        # Demo account is local to our application.
-        "demo_balance": DEFAULT_DEMO_BALANCE,
-
-        # This is ALWAYS obtained from Pocket Option.
-        "real_balance": real_balance,
-
-        "real_balance_updated_at": time.time(),
-
-        "total_trades": 0,
-        "winning_trades": 0,
-        "session_profit": 0.0,
-        "consecutive_losses": 0,
-    }
-
-    logger.info(
-        "Pocket Option session connected for user %s",
-        user_id
+    stake: float = Field(
+        gt=0
     )
 
+    real_market_mode: bool = False
+
+
+class TradingStopRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+
+
+class TradeRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+
+    asset: str = Field(
+        min_length=1,
+        max_length=64
+    )
+
+    amount: float = Field(
+        gt=0
+    )
+
+    account: str = Field(
+        default="demo"
+    )
+
+    duration: int = Field(
+        default=60,
+        gt=0,
+        le=3600
+    )
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def utc_now() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def create_user_session(
+    user_id: str
+) -> Dict[str, Any]:
+
     return {
-        "status": "connected",
+
         "user_id": user_id,
-        "session_id": session_id,
-        "real_balance": real_balance,
-        "demo_balance": DEFAULT_DEMO_BALANCE
+
+        "connected": False,
+
+        "connection_status": "not_connected",
+
+        # ----------------------------------------------------
+        # DEMO ACCOUNT
+        # ----------------------------------------------------
+
+        "demo_balance": 10000.00,
+
+        "demo_stats": {
+            "profit": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+        },
+
+        "demo_history": [],
+
+        # ----------------------------------------------------
+        # REAL ACCOUNT
+        #
+        # None means:
+        # "We have NOT received a verified real balance."
+        # ----------------------------------------------------
+
+        "real_balance": None,
+
+        "real_stats": {
+            "profit": None,
+            "trades": None,
+            "wins": None,
+            "losses": None,
+        },
+
+        "real_history": [],
+
+        # ----------------------------------------------------
+        # CURRENT TRADING SESSION
+        # ----------------------------------------------------
+
+        "trading": False,
+
+        "account": "demo",
+
+        "stake": 2.00,
+
+        "real_market_mode": False,
+
+        "session_profit": 0.0,
+
+        "session_trades": 0,
+
+        "session_wins": 0,
+
+        "session_losses": 0,
+
+        "consecutive_losses": 0,
+
+        "active_trade": None,
+
+        "session_started_at": None,
+
+        "last_trade_at": None,
+
     }
 
 
-# ---------------------------------------------------------
-# ACCOUNT STATUS
-# ---------------------------------------------------------
+def get_session(
+    user_id: str
+) -> Dict[str, Any]:
 
-@app.get("/api/session/status/{user_id}")
-async def session_status(user_id: str):
+    if user_id not in USER_SESSIONS:
 
-    session = USER_SESSIONS.get(user_id)
+        USER_SESSIONS[user_id] = \
+            create_user_session(user_id)
 
-    if not session:
-        return {
-            "connected": False,
-            "demo_balance": DEFAULT_DEMO_BALANCE,
-            "real_balance": None
-        }
-
-    return {
-        "connected": bool(session.get("connected")),
-        "demo_balance": round(
-            float(session.get("demo_balance", DEFAULT_DEMO_BALANCE)),
-            2
-        ),
-        "real_balance": round(
-            float(session["real_balance"]),
-            2
-        ) if session.get("real_balance") is not None else None,
-        "total_trades": session.get("total_trades", 0),
-        "winning_trades": session.get("winning_trades", 0),
-        "session_profit": round(
-            float(session.get("session_profit", 0)),
-            2
-        ),
-        "consecutive_losses": session.get(
-            "consecutive_losses",
-            0
-        )
-    }
+    return USER_SESSIONS[user_id]
 
 
-# ---------------------------------------------------------
-# REFRESH REAL BALANCE
-# ---------------------------------------------------------
+def validate_account(
+    account: str
+):
 
-@app.post("/api/account/balance")
-async def refresh_balance(request: BalanceRequest):
+    if account not in {
+        "demo",
+        "real"
+    }:
 
-    session = USER_SESSIONS.get(request.user_id)
-
-    if not session:
-        raise HTTPException(
-            status_code=401,
-            detail="Pocket Option account is not connected."
-        )
-
-    if request.is_demo:
-        return {
-            "account": "demo",
-            "balance": round(
-                float(session["demo_balance"]),
-                2
-            )
-        }
-
-    client = session.get("client")
-
-    if client is None:
-        raise HTTPException(
-            status_code=401,
-            detail="No active Pocket Option connection."
-        )
-
-    try:
-        balance = await client.get_balance()
-
-    except Exception as exc:
-        logger.exception(
-            "Real balance refresh failed."
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not retrieve the real Pocket Option "
-                "balance."
-            )
-        ) from exc
-
-    try:
-        real_balance = float(balance)
-
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=502,
-            detail="Pocket Option returned an invalid balance."
-        )
-
-    session["real_balance"] = real_balance
-    session["real_balance_updated_at"] = time.time()
-
-    return {
-        "account": "real",
-        "balance": round(real_balance, 2)
-    }
-
-
-# ---------------------------------------------------------
-# TRADE EXECUTION
-# ---------------------------------------------------------
-
-@app.post("/api/trade/execute")
-async def execute_trade(request: TradeExecutionRequest):
-
-    direction = request.direction.upper()
-
-    if direction not in ("CALL", "PUT"):
         raise HTTPException(
             status_code=400,
-            detail="Direction must be CALL or PUT."
+            detail=(
+                "account must be either "
+                "'demo' or 'real'"
+            )
         )
 
-    session = USER_SESSIONS.get(request.user_id)
 
-    # -----------------------------------------------------
-    # DEMO
-    # -----------------------------------------------------
+def validate_trade_amount(
+    session: Dict[str, Any],
+    account: str,
+    amount: float
+):
 
-    if request.is_demo:
+    if amount <= 0:
 
-        demo_balance = float(
-            session["demo_balance"]
-            if session
-            else DEFAULT_DEMO_BALANCE
+        raise HTTPException(
+            status_code=400,
+            detail="Stake must be greater than zero."
         )
 
-        if request.amount > demo_balance:
+
+    if account == "demo":
+
+        if session["demo_balance"] < amount:
+
             raise HTTPException(
                 status_code=400,
                 detail="Insufficient demo balance."
             )
 
-        # -------------------------------------------------
-        # DEMO RESULT
-        #
-        # This intentionally remains a simulation.
-        # Replace this section with your strategy result
-        # later.
-        # -------------------------------------------------
 
-        import random
+    elif account == "real":
 
-        won = random.random() >= 0.5
+        real_balance = \
+            session["real_balance"]
 
-        if won:
+        if real_balance is None:
 
-            profit = request.amount * 0.92
-
-            demo_balance += profit
-
-            result = "win"
-
-            if session:
-                session["winning_trades"] += 1
-                session["session_profit"] += profit
-                session["consecutive_losses"] = 0
-
-        else:
-
-            demo_balance -= request.amount
-
-            result = "loss"
-
-            if session:
-                session["session_profit"] -= request.amount
-                session["consecutive_losses"] += 1
-
-        if session:
-            session["demo_balance"] = demo_balance
-            session["total_trades"] += 1
-
-        return {
-            "status": "success",
-            "account": "demo",
-            "result": result,
-            "amount": request.amount,
-            "balance": round(demo_balance, 2)
-        }
-
-    # -----------------------------------------------------
-    # REAL ACCOUNT
-    # -----------------------------------------------------
-
-    if not session:
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "Connect the Pocket Option account before "
-                "placing a real trade."
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Real account balance has "
+                    "not been verified."
+                )
             )
-        )
 
-    client = session.get("client")
+        if real_balance < amount:
 
-    if client is None:
-        raise HTTPException(
-            status_code=401,
-            detail="No active real Pocket Option connection."
-        )
-
-    # Refresh balance BEFORE placing the order.
-    try:
-        current_balance = await client.get_balance()
-
-    except Exception as exc:
-        logger.exception(
-            "Unable to verify real balance."
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Unable to verify the real Pocket Option "
-                "balance. Trade was NOT sent."
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient real balance."
             )
-        ) from exc
 
-    try:
-        current_balance = float(current_balance)
 
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid balance returned by Pocket Option."
-        )
+# ============================================================
+# MARKET ENGINE
+# ============================================================
 
-    if request.amount > current_balance:
-        raise HTTPException(
-            status_code=400,
-            detail="Insufficient real Pocket Option balance."
-        )
+def get_market_prediction():
 
-    AsyncPocketOptionClient, OrderDirection = (
-        load_pocket_client()
+    return {
+
+        "recommended_asset": "EURUSD_otc",
+
+        "payout": "92%",
+
+        "predicted_direction": "CALL",
+
+        "confidence_score": 89.2,
+
+        "rsi_value": 28.4,
+
+        "reason": (
+            "RSI indicates oversold conditions "
+            "(28.4) with high payout."
+        ),
+
+        "generated_at": utc_now(),
+
+    }
+
+
+def get_markets():
+
+    prediction = \
+        get_market_prediction()
+
+    recommended = \
+        prediction["recommended_asset"]
+
+    markets = [
+
+        {
+            "asset": recommended,
+            "payout": 92,
+            "confidence": 89.2,
+            "favourable": True,
+        },
+
+        {
+            "asset": "GBPUSD_otc",
+            "payout": 88,
+            "confidence": 74.0,
+            "favourable": False,
+        },
+
+        {
+            "asset": "USDJPY_otc",
+            "payout": 85,
+            "confidence": 69.0,
+            "favourable": False,
+        },
+
+        {
+            "asset": "BTCUSD",
+            "payout": 80,
+            "confidence": 66.0,
+            "favourable": False,
+        },
+
+    ]
+
+    return {
+
+        "recommended_asset": recommended,
+
+        "markets": markets,
+
+        "generated_at": utc_now(),
+
+    }
+
+
+# ============================================================
+# ROOT / HEALTH
+# ============================================================
+
+@app.get("/")
+async def root():
+
+    return {
+
+        "status": "online",
+
+        "service": "Fixed Risk Booster API",
+
+        "version": APP_VERSION,
+
+        "time": utc_now(),
+
+    }
+
+
+@app.get("/api/health")
+async def health():
+
+    return {
+
+        "status": "healthy",
+
+        "version": APP_VERSION,
+
+        "users_in_memory":
+            len(USER_SESSIONS),
+
+        "time": utc_now(),
+
+    }
+
+
+# ============================================================
+# MARKET ENDPOINTS
+# ============================================================
+
+@app.get(
+    "/api/market/prediction"
+)
+async def market_prediction():
+
+    return get_market_prediction()
+
+
+@app.get(
+    "/api/markets"
+)
+async def markets():
+
+    return get_markets()
+
+
+# ============================================================
+# SESSION REGISTER
+#
+# IMPORTANT:
+# This endpoint currently registers the Mini App user.
+#
+# It does NOT pretend that a Pocket Option account
+# has been authenticated.
+# ============================================================
+
+@app.post(
+    "/api/session/register"
+)
+async def register_session(
+    request: SessionRegisterRequest
+):
+
+    session =
+        get_session(request.user_id)
+
+    session["connected"] = False
+
+    session["connection_status"] = \
+        "not_connected"
+
+    return {
+
+        "status": "registered",
+
+        "user_id": request.user_id,
+
+        "connected": False,
+
+        "connection_status":
+            "not_connected",
+
+        "balances": {
+
+            "demo":
+                session["demo_balance"],
+
+            "real":
+                session["real_balance"],
+
+        },
+
+        "message": (
+            "Mini App session registered. "
+            "Pocket Option account has not "
+            "been verified."
+        ),
+
+    }
+
+
+# ============================================================
+# SESSION STATUS
+# ============================================================
+
+@app.get(
+    "/api/session/status/{user_id}"
+)
+async def session_status(
+    user_id: str
+):
+
+    session =
+        get_session(user_id)
+
+    return {
+
+        "user_id": user_id,
+
+        "connected":
+            session["connected"],
+
+        "connection_status":
+            session["connection_status"],
+
+        "account":
+            session["account"],
+
+    }
+
+
+# ============================================================
+# ACCOUNT BALANCE
+# ============================================================
+
+@app.get(
+    "/api/account/balance/{user_id}"
+)
+async def account_balance(
+    user_id: str
+):
+
+    session =
+        get_session(user_id)
+
+    return {
+
+        "demo": {
+
+            "balance":
+                session["demo_balance"],
+
+        },
+
+        "real": {
+
+            "balance":
+                session["real_balance"],
+
+            "verified":
+                (
+                    session["real_balance"]
+                    is not None
+                ),
+
+        },
+
+    }
+
+
+# ============================================================
+# START TRADING SESSION
+# ============================================================
+
+@app.post(
+    "/api/trading/start"
+)
+async def start_trading(
+    request: TradingStartRequest
+):
+
+    validate_account(
+        request.account
     )
 
-    # Convert our direction to the connector direction.
-    if direction == "CALL":
-        broker_direction = OrderDirection.CALL
+
+    session =
+        get_session(request.user_id)
+
+
+    # --------------------------------------------------------
+    # Validate real account
+    # --------------------------------------------------------
+
+    if request.account == "real":
+
+        if not session["connected"]:
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Real account is not "
+                    "connected and verified."
+                )
+            )
+
+
+        if session["real_balance"] is None:
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Real account balance "
+                    "has not been verified."
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # Demo balance validation
+    # --------------------------------------------------------
+
+    if request.account == "demo":
+
+        if (
+            session["demo_balance"]
+            < request.stake
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Insufficient demo balance."
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # Start fresh session
+    # --------------------------------------------------------
+
+    session["trading"] = True
+
+    session["account"] =
+        request.account
+
+    session["stake"] =
+        round(request.stake, 2)
+
+    session["real_market_mode"] =
+        request.real_market_mode
+
+    session["session_profit"] = 0.0
+
+    session["session_trades"] = 0
+
+    session["session_wins"] = 0
+
+    session["session_losses"] = 0
+
+    session["consecutive_losses"] = 0
+
+    session["active_trade"] = None
+
+    session["session_started_at"] =
+        utc_now()
+
+    return {
+
+        "status": "started",
+
+        "account":
+            session["account"],
+
+        "stake":
+            session["stake"],
+
+        "real_market_mode":
+            session["real_market_mode"],
+
+        "session_started_at":
+            session["session_started_at"],
+
+    }
+
+
+# ============================================================
+# STOP TRADING SESSION
+# ============================================================
+
+@app.post(
+    "/api/trading/stop"
+)
+async def stop_trading(
+    request: TradingStopRequest
+):
+
+    session =
+        get_session(request.user_id)
+
+    session["trading"] = False
+
+    session["active_trade"] = None
+
+    return {
+
+        "status": "stopped",
+
+        "account":
+            session["account"],
+
+        "session_profit":
+            session["session_profit"],
+
+        "session_trades":
+            session["session_trades"],
+
+        "session_wins":
+            session["session_wins"],
+
+        "session_losses":
+            session["session_losses"],
+
+    }
+
+
+# ============================================================
+# TRADING STATUS
+# ============================================================
+
+@app.get(
+    "/api/trading/status/{user_id}"
+)
+async def trading_status(
+    user_id: str
+):
+
+    session =
+        get_session(user_id)
+
+    return {
+
+        "trading":
+            session["trading"],
+
+        "account":
+            session["account"],
+
+        "stake":
+            session["stake"],
+
+        "session_profit":
+            session["session_profit"],
+
+        "session_trades":
+            session["session_trades"],
+
+        "session_wins":
+            session["session_wins"],
+
+        "session_losses":
+            session["session_losses"],
+
+        "consecutive_losses":
+            session["consecutive_losses"],
+
+        "active_trade":
+            session["active_trade"],
+
+    }
+
+
+# ============================================================
+# DEMO TRADE
+#
+# This is the ONLY place where the backend simulates a
+# result at this stage.
+#
+# Real trades are intentionally blocked until the broker
+# adapter is verified.
+# ============================================================
+
+async def execute_demo_trade(
+    session: Dict[str, Any],
+    asset: str,
+    amount: float,
+    duration: int
+):
+
+    validate_trade_amount(
+        session,
+        "demo",
+        amount
+    )
+
+
+    # --------------------------------------------------------
+    # Fixed-risk result
+    #
+    # 92% payout:
+    # WIN  = +amount * 0.92
+    # LOSS = -amount
+    #
+    # This first backend stage uses a deterministic alternating
+    # demo result for testing the accounting API.
+    #
+    # We can replace this with the actual demo market engine
+    # later.
+    # --------------------------------------------------------
+
+    next_trade_number =
+        session["demo_stats"]["trades"] + 1
+
+
+    is_win =
+        next_trade_number % 2 == 1
+
+
+    profit =
+        (
+            amount * 0.92
+            if is_win
+            else -amount
+        )
+
+
+    # --------------------------------------------------------
+    # Balance
+    # --------------------------------------------------------
+
+    session["demo_balance"] += profit
+
+
+    # --------------------------------------------------------
+    # Session statistics
+    # --------------------------------------------------------
+
+    session["session_profit"] += profit
+
+    session["session_trades"] += 1
+
+
+    # --------------------------------------------------------
+    # All-time Demo statistics
+    # --------------------------------------------------------
+
+    session["demo_stats"]["profit"] += \
+        profit
+
+    session["demo_stats"]["trades"] += 1
+
+
+    if is_win:
+
+        session["session_wins"] += 1
+
+        session["demo_stats"]["wins"] += 1
+
+        session["consecutive_losses"] = 0
+
+        result = "WIN"
+
     else:
-        broker_direction = OrderDirection.PUT
 
-    # -----------------------------------------------------
-    # REAL ORDER
-    # -----------------------------------------------------
+        session["session_losses"] += 1
 
-    try:
+        session["demo_stats"]["losses"] += 1
 
-        order = await client.place_order(
-            asset=request.asset,
-            amount=request.amount,
-            direction=broker_direction,
-            duration=request.duration
-        )
+        session["consecutive_losses"] += 1
 
-    except Exception as exc:
+        result = "LOSS"
 
-        logger.exception(
-            "Pocket Option real order failed."
-        )
 
-        # VERY IMPORTANT:
-        # We do NOT return success.
-        # We do NOT create a fake order ID.
-        # We do NOT subtract the balance locally.
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Pocket Option rejected or failed to execute "
-                "the real trade."
-            )
-        ) from exc
+    order_id =
+        "DEMO-" +
+        uuid.uuid4().hex[:12].upper()
 
-    session["total_trades"] += 1
 
-    # Refresh the REAL broker balance after execution.
-    try:
-        updated_balance = await client.get_balance()
-        updated_balance = float(updated_balance)
+    trade = {
 
-    except Exception:
-        # The order was genuinely submitted, but balance
-        # refresh failed. Do not invent a balance.
-        updated_balance = None
+        "order_id": order_id,
 
-    session["real_balance"] = updated_balance
+        "account": "demo",
 
-    return {
-        "status": "success",
-        "account": "real",
-        "asset": request.asset,
-        "direction": direction,
-        "amount": request.amount,
-        "duration": request.duration,
-        "order": str(order),
-        "real_balance": (
-            round(updated_balance, 2)
-            if updated_balance is not None
-            else None
+        "asset": asset,
+
+        "stake": amount,
+
+        "duration": duration,
+
+        "result": result,
+
+        "profit": round(
+            profit,
+            2
         ),
-        "balance_refresh": (
-            "success"
-            if updated_balance is not None
-            else "failed"
-        )
+
+        "timestamp": utc_now(),
+
     }
 
 
-# ---------------------------------------------------------
-# LOGOUT
-# ---------------------------------------------------------
+    session["demo_history"].insert(
+        0,
+        trade
+    )
 
-@app.post("/api/session/logout/{user_id}")
-async def logout(user_id: str):
 
-    session = USER_SESSIONS.pop(user_id, None)
+    session["demo_history"] =
+        session["demo_history"][:100]
 
-    if not session:
-        return {
-            "status": "logged_out"
-        }
 
-    client = session.get("client")
+    session["last_trade_at"] =
+        trade["timestamp"]
 
-    # Try to close the broker connection if the installed
-    # connector supports it.
-    if client is not None:
 
-        try:
+    # --------------------------------------------------------
+    # Three-loss protection
+    # --------------------------------------------------------
 
-            close_method = getattr(
-                client,
-                "disconnect",
-                None
-            )
+    if (
+        session["consecutive_losses"]
+        >= 3
+    ):
 
-            if close_method:
-                result = close_method()
+        session["trading"] = False
 
-                if hasattr(result, "__await__"):
-                    await result
+        protection_message = (
+            "Session closed after 3 "
+            "consecutive losses to "
+            "protect balance"
+        )
 
-        except Exception:
-            logger.warning(
-                "Could not cleanly disconnect broker client."
-            )
+    else:
+
+        protection_message = None
+
 
     return {
-        "status": "logged_out"
+
+        "status": "completed",
+
+        "order_id": order_id,
+
+        "account": "demo",
+
+        "asset": asset,
+
+        "stake": amount,
+
+        "result": result,
+
+        "profit": round(
+            profit,
+            2
+        ),
+
+        "remaining_balance":
+            round(
+                session["demo_balance"],
+                2
+            ),
+
+        "session_profit":
+            round(
+                session["session_profit"],
+                2
+            ),
+
+        "session_trades":
+            session["session_trades"],
+
+        "session_wins":
+            session["session_wins"],
+
+        "session_losses":
+            session["session_losses"],
+
+        "consecutive_losses":
+            session["consecutive_losses"],
+
+        "trading":
+            session["trading"],
+
+        "protection_message":
+            protection_message,
+
     }
 
 
-# ---------------------------------------------------------
-# START SERVER
-# ---------------------------------------------------------
+# ============================================================
+# REAL TRADE PLACEHOLDER
+#
+# We deliberately DO NOT fake a real order.
+# ============================================================
+
+async def execute_real_trade(
+    session: Dict[str, Any],
+    asset: str,
+    amount: float,
+    duration: int
+):
+
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Real broker execution is not "
+            "enabled yet. The broker adapter "
+            "must be verified before real "
+            "orders are allowed."
+        )
+    )
+
+
+# ============================================================
+# TRADE EXECUTION
+# ============================================================
+
+@app.post(
+    "/api/trade/execute"
+)
+async def execute_trade(
+    request: TradeRequest
+):
+
+    validate_account(
+        request.account
+    )
+
+
+    session =
+        get_session(request.user_id)
+
+
+    # --------------------------------------------------------
+    # Trading must have been started
+    # --------------------------------------------------------
+
+    if not session["trading"]:
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Trading session is not active."
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # Fixed stake enforcement
+    #
+    # Once a session starts, every trade must use exactly
+    # the opening stake.
+    # --------------------------------------------------------
+
+    opening_stake =
+        session["stake"]
+
+
+    if round(
+        request.amount,
+        2
+    ) != round(
+        opening_stake,
+        2
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Fixed-risk violation: "
+                "trade amount must equal "
+                f"the opening stake "
+                f"({opening_stake:.2f})."
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # DEMO
+    # --------------------------------------------------------
+
+    if request.account == "demo":
+
+        return await execute_demo_trade(
+
+            session=session,
+
+            asset=request.asset,
+
+            amount=opening_stake,
+
+            duration=request.duration,
+
+        )
+
+
+    # --------------------------------------------------------
+    # REAL
+    # --------------------------------------------------------
+
+    return await execute_real_trade(
+
+        session=session,
+
+        asset=request.asset,
+
+        amount=opening_stake,
+
+        duration=request.duration,
+
+    )
+
+
+# ============================================================
+# TRADE HISTORY
+# ============================================================
+
+@app.get(
+    "/api/trades/{user_id}"
+)
+async def trade_history(
+    user_id: str,
+    account: str = "demo"
+):
+
+    validate_account(account)
+
+    session =
+        get_session(user_id)
+
+
+    if account == "demo":
+
+        history =
+            session["demo_history"]
+
+    else:
+
+        history =
+            session["real_history"]
+
+
+    return {
+
+        "account": account,
+
+        "trades": history,
+
+    }
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+@app.get(
+    "/api/stats/{user_id}"
+)
+async def statistics(
+    user_id: str,
+    account: str = "demo"
+):
+
+    validate_account(account)
+
+    session =
+        get_session(user_id)
+
+
+    if account == "demo":
+
+        stats =
+            session["demo_stats"]
+
+        trades =
+            stats["trades"]
+
+        wins =
+            stats["wins"]
+
+        profit =
+            stats["profit"]
+
+    else:
+
+        stats =
+            session["real_stats"]
+
+        trades =
+            stats["trades"]
+
+        wins =
+            stats["wins"]
+
+        profit =
+            stats["profit"]
+
+
+    if (
+        trades is None
+        or wins is None
+    ):
+
+        win_rate = None
+
+    elif trades == 0:
+
+        win_rate = 0.0
+
+    else:
+
+        win_rate =
+            round(
+                wins /
+                trades *
+                100,
+                2
+            )
+
+
+    return {
+
+        "account": account,
+
+        "profit": profit,
+
+        "trades": trades,
+
+        "wins": wins,
+
+        "losses":
+            (
+                stats["losses"]
+                if stats["losses"] is not None
+                else None
+            ),
+
+        "win_rate":
+            win_rate,
+
+    }
+
+
+# ============================================================
+# SERVER
+# ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
+    port =
+        int(
+            os.getenv(
+                "PORT",
+                "10000"
+            )
         )
-    )
 
     uvicorn.run(
         app,
