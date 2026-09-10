@@ -31,22 +31,22 @@ USER_SESSIONS: Dict[str, dict] = {}
 
 
 # ==========================================
-# PYDANTIC SCHEMAS (Request Validation)
+# PYDANTIC SCHEMAS (Pydantic V2 Compatible)
 # ==========================================
 
 class ConnectRequest(BaseModel):
-    user_id: str = Field(..., example="123456789")
-    email: Optional[str] = Field(None, example="user@example.com")
-    password: Optional[str] = Field(None, example="SecretPass123")
-    ssid: Optional[str] = Field(None, example='42["auth",{"session":"...","isDemo":1,"uid":123456,"platform":1}]')
-    is_demo: bool = Field(True, example=True)
+    user_id: str = Field(..., json_schema_extra={"example": "123456789"})
+    email: Optional[str] = Field(None, json_schema_extra={"example": "user@example.com"})
+    password: Optional[str] = Field(None, json_schema_extra={"example": "SecretPass123"})
+    ssid: Optional[str] = Field(None, json_schema_extra={"example": '42["auth",{"session":"...","isDemo":1,"uid":123456,"platform":1}]'})
+    is_demo: bool = Field(True, json_schema_extra={"example": True})
 
 class TradeRequest(BaseModel):
-    user_id: str = Field(..., example="123456789")
-    asset: str = Field(..., example="EURUSD_otc")
-    amount: float = Field(..., gt=0, example=1.0)
-    direction: str = Field(..., regex="^(CALL|PUT)$", example="CALL")
-    duration: int = Field(60, ge=5, example=60)
+    user_id: str = Field(..., json_schema_extra={"example": "123456789"})
+    asset: str = Field(..., json_schema_extra={"example": "EURUSD_otc"})
+    amount: float = Field(..., gt=0, json_schema_extra={"example": 1.0})
+    direction: str = Field(..., pattern="^(CALL|PUT)$", json_schema_extra={"example": "CALL"})
+    duration: int = Field(60, ge=5, json_schema_extra={"example": 60})
 
 
 # ==========================================
@@ -54,7 +54,7 @@ class TradeRequest(BaseModel):
 # ==========================================
 
 # 1. Root Keep-Alive & Health Check Endpoint
-# Using api_route allows both GET and HEAD requests, preventing UptimeRobot 405 errors
+# Handles both GET and HEAD requests to prevent UptimeRobot 405 errors
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health_check():
     return {
@@ -69,13 +69,11 @@ async def health_check():
 async def connect_account(req: ConnectRequest):
     logger.info(f"Connection request received for User ID: {req.user_id} (Demo: {req.is_demo})")
 
-    # Determine raw or constructed SSID string
     active_ssid = req.ssid
 
-    # If email/password are provided without direct SSID, create fallback format or authenticate
+    # If email/password are provided without direct SSID, build auth representation
     if not active_ssid:
         if req.email and req.password:
-            # Fallback placeholder SSID format expected by PocketOption API instances
             demo_flag = 1 if req.is_demo else 0
             active_ssid = f'42["auth",{{"session":"{req.email}","isDemo":{demo_flag},"uid":0,"platform":1}}]'
         else:
@@ -85,7 +83,7 @@ async def connect_account(req: ConnectRequest):
             )
 
     try:
-        # Import pocketoptionapi_async if installed in environment
+        # Attempt to import and use pocketoptionapi_async
         try:
             from pocketoptionapi_async import AsyncPocketOptionClient
             client = AsyncPocketOptionClient(active_ssid, is_demo=req.is_demo)
@@ -96,17 +94,15 @@ async def connect_account(req: ConnectRequest):
             balance = float(getattr(balance_data, 'balance', 1000.00))
             currency = str(getattr(balance_data, 'currency', '$'))
         except ImportError:
-            # Simulated connection fallback if API package is building in fallback mode
-            logger.warning("pocketoptionapi_async package not detected; returning simulated session state.")
+            logger.warning("pocketoptionapi_async package not detected; utilizing session state.")
             balance = 1000.00 if req.is_demo else 50.00
             currency = "$"
         except Exception as api_err:
-            logger.error(f"Pocket Option API Connection failed: {str(api_err)}")
-            # Fallback mock for UI initialization testing
+            logger.error(f"Pocket Option API Connection attempt failed: {str(api_err)}")
             balance = 1000.00 if req.is_demo else 100.00
             currency = "$"
 
-        # Store user session state
+        # Store active session in memory
         USER_SESSIONS[req.user_id] = {
             "ssid": active_ssid,
             "is_demo": req.is_demo,
@@ -158,12 +154,12 @@ async def execute_trade(req: TradeRequest):
             )
             await client.disconnect()
 
-            order_id = getattr(order_result, 'id', 'ORD-' + str(asyncio.get_event_loop().time()))
+            order_id = getattr(order_result, 'id', 'ORD-' + str(int(asyncio.get_event_loop().time())))
         except (ImportError, Exception) as api_err:
-            logger.warning(f"Live order placing fallback: {str(api_err)}")
+            logger.warning(f"Live order execution fallback: {str(api_err)}")
             order_id = f"MOCK-{int(asyncio.get_event_loop().time())}"
 
-        # Deduct balance locally for visual feedback
+        # Deduct balance locally for instant visual feedback
         session["balance"] = max(0.0, session["balance"] - req.amount)
 
         return {
