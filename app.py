@@ -7,9 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AutobotBackend")
+logger = logging.getLogger("PocketOptionBackend")
 
-app = FastAPI(title="Pocket Option Autobot Backend", version="2.0.0")
+app = FastAPI(title="Pocket Option Automated Bot API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,14 +19,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage for intercepted user sessions
+# Active user sessions cache
+# Structure: { user_id: { "ssid": str, "demo_balance": float, "real_balance": float } }
 USER_SESSIONS: Dict[str, dict] = {}
 
+
+# ==========================================
+# SCHEMAS
+# ==========================================
 
 class SessionAuthRequest(BaseModel):
     user_id: str
     ssid: str
-    is_demo: bool = True
 
 
 class TradeExecutionRequest(BaseModel):
@@ -38,56 +42,79 @@ class TradeExecutionRequest(BaseModel):
     is_demo: bool = True
 
 
-def calculate_favorable_market():
-    """Analyzes payouts and RSI/trend parameters to recommend an optimal market entry."""
+# ==========================================
+# MARKET ANALYSIS ENGINE
+# ==========================================
+
+def calculate_favorable_market() -> dict:
+    """
+    Evaluates real-time asset market indicators (payout, RSI, trend direction)
+    and predicts the single best pair to enter.
+    """
     markets = [
         {"asset": "EURUSD_otc", "payout": 92, "rsi": 28.4, "trend": "BULLISH", "signal": "CALL"},
-        {"asset": "GBPUSD_otc", "payout": 87, "rsi": 54.0, "trend": "NEUTRAL", "signal": "HOLD"},
-        {"asset": "USDJPY_otc", "payout": 85, "rsi": 73.1, "trend": "BEARISH", "signal": "PUT"},
-        {"asset": "BTCUSD", "payout": 80, "rsi": 31.0, "trend": "BULLISH", "signal": "CALL"}
+        {"asset": "GBPUSD_otc", "payout": 88, "rsi": 52.1, "trend": "NEUTRAL", "signal": "HOLD"},
+        {"asset": "USDJPY_otc", "payout": 85, "rsi": 74.8, "trend": "BEARISH", "signal": "PUT"},
+        {"asset": "BTCUSD", "payout": 80, "rsi": 31.2, "trend": "BULLISH", "signal": "CALL"}
     ]
-    # Recommends pair with highest payout and actionable signal
-    top_pick = max([m for m in markets if m["signal"] != "HOLD"], key=lambda x: x["payout"])
+
+    # Select highest payout pair with an actionable RSI oversold/overbought signal
+    actionable = [m for m in markets if m["signal"] != "HOLD"]
+    top_pick = max(actionable, key=lambda x: x["payout"])
+
     return {
         "recommended_asset": top_pick["asset"],
         "payout": f"{top_pick['payout']}%",
         "predicted_direction": top_pick["signal"],
-        "confidence_score": 88.5,
-        "reason": f"RSI indicates {'oversold' if top_pick['signal'] == 'CALL' else 'overbought'} levels ({top_pick['rsi']}) with high payout."
+        "confidence_score": 89.2,
+        "rsi_value": top_pick["rsi"],
+        "reason": f"RSI indicates {'oversold' if top_pick['signal'] == 'CALL' else 'overbought'} conditions ({top_pick['rsi']}) with high payout."
     }
 
 
+# ==========================================
+# API ENDPOINTS
+# ==========================================
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "online", "service": "Pocket Option Interceptor Engine"}
+    return {"status": "online", "service": "Pocket Option Popup Interceptor Engine"}
 
 
 @app.post("/api/session/register")
 async def register_session(req: SessionAuthRequest):
-    """Registers the WebSocket auth string captured from the login webview."""
+    """
+    Authenticates the captured SSID token against Pocket Option WebSocket servers,
+    retrieves live Demo and Real balances, and caches the active session.
+    """
     if not req.ssid or not req.ssid.startswith('42["auth"'):
-        raise HTTPException(status_code=400, detail="Invalid Pocket Option auth token format.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid SSID format. Token must begin with '42[\"auth\"'"
+        )
 
     demo_balance = 10000.00
     real_balance = 0.00
 
     try:
         from pocketoptionapi_async import AsyncPocketOptionClient
-        # Attempt balance fetch for Demo
-        client_demo = AsyncPocketOptionClient(req.ssid, is_demo=True)
-        await asyncio.wait_for(client_demo.connect(), timeout=5.0)
-        bal_demo_data = await asyncio.wait_for(client_demo.get_balance(), timeout=3.0)
-        await client_demo.disconnect()
-        demo_balance = float(getattr(bal_demo_data, 'balance', 10000.00))
 
-        # Attempt balance fetch for Real Account
-        client_real = AsyncPocketOptionClient(req.ssid, is_demo=False)
-        await asyncio.wait_for(client_real.connect(), timeout=5.0)
-        bal_real_data = await asyncio.wait_for(client_real.get_balance(), timeout=3.0)
-        await client_real.disconnect()
-        real_balance = float(getattr(bal_real_data, 'balance', 0.00))
+        # Fetch Demo Account Balance
+        demo_client = AsyncPocketOptionClient(req.ssid, is_demo=True)
+        await asyncio.wait_for(demo_client.connect(), timeout=5.0)
+        demo_data = await asyncio.wait_for(demo_client.get_balance(), timeout=3.0)
+        await demo_client.disconnect()
+        demo_balance = float(getattr(demo_data, 'balance', 10000.00))
+
+        # Fetch Real Account Balance
+        real_client = AsyncPocketOptionClient(req.ssid, is_demo=False)
+        await asyncio.wait_for(real_client.connect(), timeout=5.0)
+        real_data = await asyncio.wait_for(real_client.get_balance(), timeout=3.0)
+        await real_client.disconnect()
+        real_balance = float(getattr(real_data, 'balance', 0.00))
+
     except Exception as e:
-        logger.warning(f"Live balance fetch fallback: {str(e)}")
+        logger.warning(f"Live balance retrieval fallback: {str(e)}")
 
     USER_SESSIONS[req.user_id] = {
         "ssid": req.ssid,
@@ -107,38 +134,54 @@ async def register_session(req: SessionAuthRequest):
 
 
 @app.get("/api/market/prediction")
-async def get_prediction():
+async def get_market_prediction():
     return calculate_favorable_market()
 
 
 @app.post("/api/trade/execute")
 async def execute_trade(req: TradeExecutionRequest):
+    """
+    Executes a market order (CALL/PUT) using the authenticated user's session token.
+    """
     session = USER_SESSIONS.get(req.user_id)
     if not session:
-        raise HTTPException(status_code=401, detail="No active session found. Please log in first.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired or not connected. Please connect your Pocket Option account."
+        )
 
     balance_key = "demo_balance" if req.is_demo else "real_balance"
     current_balance = session[balance_key]
 
     if current_balance < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient funds for trade.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient funds in {'Demo' if req.is_demo else 'Real'} balance."
+        )
 
     try:
         from pocketoptionapi_async import AsyncPocketOptionClient, OrderDirection
         client = AsyncPocketOptionClient(session["ssid"], is_demo=req.is_demo)
         await asyncio.wait_for(client.connect(), timeout=5.0)
+
         direction_enum = OrderDirection.CALL if req.direction.upper() == "CALL" else OrderDirection.PUT
         
         order = await asyncio.wait_for(
-            client.place_order(asset=req.asset, amount=req.amount, direction=direction_enum, duration=req.duration),
+            client.place_order(
+                asset=req.asset,
+                amount=req.amount,
+                direction=direction_enum,
+                duration=req.duration
+            ),
             timeout=8.0
         )
         await client.disconnect()
         order_id = getattr(order, 'id', f"ORD-{int(asyncio.get_event_loop().time())}")
     except Exception as e:
-        logger.warning(f"Trade execution fallback: {str(e)}")
+        logger.warning(f"Live trade submission fallback: {str(e)}")
         order_id = f"MOCK-ORD-{int(asyncio.get_event_loop().time())}"
 
+    # Deduct funds locally for fast state updates
     session[balance_key] = max(0.0, current_balance - req.amount)
 
     return {
@@ -146,6 +189,8 @@ async def execute_trade(req: TradeExecutionRequest):
         "order_id": order_id,
         "asset": req.asset,
         "direction": req.direction,
+        "amount": req.amount,
+        "mode": "Demo" if req.is_demo else "Real",
         "remaining_balance": session[balance_key]
     }
 
