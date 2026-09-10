@@ -431,8 +431,7 @@ async def register_session(
     request: SessionRegisterRequest
 ):
 
-    session =
-        get_session(request.user_id)
+    session = get_session(request.user_id)
 
     session["connected"] = False
 
@@ -480,8 +479,7 @@ async def session_status(
     user_id: str
 ):
 
-    session =
-        get_session(user_id)
+    session = get_session(user_id)
 
     return {
 
@@ -510,8 +508,7 @@ async def account_balance(
     user_id: str
 ):
 
-    session =
-        get_session(user_id)
+    session = get_session(user_id)
 
     return {
 
@@ -554,8 +551,7 @@ async def start_trading(
     )
 
 
-    session =
-        get_session(request.user_id)
+    session = get_session(request.user_id)
 
 
     # --------------------------------------------------------
@@ -611,14 +607,11 @@ async def start_trading(
 
     session["trading"] = True
 
-    session["account"] =
-        request.account
+    session["account"] = request.account
 
-    session["stake"] =
-        round(request.stake, 2)
+    session["stake"] = round(request.stake, 2)
 
-    session["real_market_mode"] =
-        request.real_market_mode
+    session["real_market_mode"] = request.real_market_mode
 
     session["session_profit"] = 0.0
 
@@ -632,8 +625,7 @@ async def start_trading(
 
     session["active_trade"] = None
 
-    session["session_started_at"] =
-        utc_now()
+    session["session_started_at"] = utc_now()
 
     return {
 
@@ -665,8 +657,7 @@ async def stop_trading(
     request: TradingStopRequest
 ):
 
-    session =
-        get_session(request.user_id)
+    session = get_session(request.user_id)
 
     session["trading"] = False
 
@@ -705,8 +696,7 @@ async def trading_status(
     user_id: str
 ):
 
-    session =
-        get_session(user_id)
+    session = get_session(user_id)
 
     return {
 
@@ -778,16 +768,13 @@ async def execute_demo_trade(
     # later.
     # --------------------------------------------------------
 
-    next_trade_number =
-        session["demo_stats"]["trades"] + 1
+    next_trade_number = session["demo_stats"]["trades"] + 1
 
 
-    is_win =
-        next_trade_number % 2 == 1
+    is_win = next_trade_number % 2 == 1
 
 
-    profit =
-        (
+    profit = (
             amount * 0.92
             if is_win
             else -amount
@@ -841,9 +828,7 @@ async def execute_demo_trade(
         result = "LOSS"
 
 
-    order_id =
-        "DEMO-" +
-        uuid.uuid4().hex[:12].upper()
+    order_id = "DEMO-" + uuid.uuid4().hex[:12].upper()
 
 
     trade = {
@@ -876,12 +861,10 @@ async def execute_demo_trade(
     )
 
 
-    session["demo_history"] =
-        session["demo_history"][:100]
+    session["demo_history"] = session["demo_history"][:100]
 
 
-    session["last_trade_at"] =
-        trade["timestamp"]
+    session["last_trade_at"] = trade["timestamp"]
 
 
     # --------------------------------------------------------
@@ -998,8 +981,7 @@ async def execute_trade(
     )
 
 
-    session =
-        get_session(request.user_id)
+    session = get_session(request.user_id)
 
 
     # --------------------------------------------------------
@@ -1023,8 +1005,7 @@ async def execute_trade(
     # the opening stake.
     # --------------------------------------------------------
 
-    opening_stake =
-        session["stake"]
+    opening_stake = session["stake"]
 
 
     if round(
@@ -1096,19 +1077,16 @@ async def trade_history(
 
     validate_account(account)
 
-    session =
-        get_session(user_id)
+    session = get_session(user_id)
 
 
     if account == "demo":
 
-        history =
-            session["demo_history"]
+        history = session["demo_history"]
 
     else:
 
-        history =
-            session["real_history"]
+        history = session["real_history"]
 
 
     return {
@@ -1134,37 +1112,28 @@ async def statistics(
 
     validate_account(account)
 
-    session =
-        get_session(user_id)
+    session = get_session(user_id)
 
 
     if account == "demo":
 
-        stats =
-            session["demo_stats"]
+        stats = session["demo_stats"]
 
-        trades =
-            stats["trades"]
+        trades = stats["trades"]
 
-        wins =
-            stats["wins"]
+        wins = stats["wins"]
 
-        profit =
-            stats["profit"]
+        profit = stats["profit"]
 
     else:
 
-        stats =
-            session["real_stats"]
+        stats = session["real_stats"]
 
-        trades =
-            stats["trades"]
+        trades = stats["trades"]
 
-        wins =
-            stats["wins"]
+        wins = stats["wins"]
 
-        profit =
-            stats["profit"]
+        profit = stats["profit"]
 
 
     if (
@@ -1180,8 +1149,7 @@ async def statistics(
 
     else:
 
-        win_rate =
-            round(
+        win_rate = round(
                 wins /
                 trades *
                 100,
@@ -1220,8 +1188,7 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    port =
-        int(
+    port = int(
             os.getenv(
                 "PORT",
                 "10000"
