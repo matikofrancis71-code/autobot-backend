@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-requests
+pydantic
+curl_cffi
+beautifulsoup4
 pocketoptionapi-async
