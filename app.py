@@ -9,13 +9,14 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PocketOptionBackend")
 
-app = FastAPI(title="Pocket Option Automated Bot API", version="2.0.0")
+app = FastAPI(title="Pocket Option Automated Bot API", version="2.1.0")
 
+# Strict Wildcard CORS Policy (explicitly supporting cross-origin POST preflights)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,  # Must be False when using wildcard allow_origins=["*"]
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -48,8 +49,7 @@ class TradeExecutionRequest(BaseModel):
 
 def calculate_favorable_market() -> dict:
     """
-    Evaluates real-time asset market indicators (payout, RSI, trend direction)
-    and predicts the single best pair to enter.
+    Evaluates market parameters (payout, RSI, trend) and recommends optimal pairs.
     """
     markets = [
         {"asset": "EURUSD_otc", "payout": 92, "rsi": 28.4, "trend": "BULLISH", "signal": "CALL"},
@@ -58,7 +58,6 @@ def calculate_favorable_market() -> dict:
         {"asset": "BTCUSD", "payout": 80, "rsi": 31.2, "trend": "BULLISH", "signal": "CALL"}
     ]
 
-    # Select highest payout pair with an actionable RSI oversold/overbought signal
     actionable = [m for m in markets if m["signal"] != "HOLD"]
     top_pick = max(actionable, key=lambda x: x["payout"])
 
@@ -76,7 +75,7 @@ def calculate_favorable_market() -> dict:
 # API ENDPOINTS
 # ==========================================
 
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/", methods=["GET", "HEAD", "OPTIONS"])
 async def root():
     return {"status": "online", "service": "Pocket Option Popup Interceptor Engine"}
 
@@ -84,8 +83,8 @@ async def root():
 @app.post("/api/session/register")
 async def register_session(req: SessionAuthRequest):
     """
-    Authenticates the captured SSID token against Pocket Option WebSocket servers,
-    retrieves live Demo and Real balances, and caches the active session.
+    Validates and registers the Pocket Option SSID token.
+    Fetches real account balances or defaults gracefully on connection timeout.
     """
     if not req.ssid or not req.ssid.startswith('42["auth"'):
         raise HTTPException(
@@ -99,22 +98,22 @@ async def register_session(req: SessionAuthRequest):
     try:
         from pocketoptionapi_async import AsyncPocketOptionClient
 
-        # Fetch Demo Account Balance
+        # Attempt Demo Balance Retrieval
         demo_client = AsyncPocketOptionClient(req.ssid, is_demo=True)
-        await asyncio.wait_for(demo_client.connect(), timeout=5.0)
+        await asyncio.wait_for(demo_client.connect(), timeout=4.0)
         demo_data = await asyncio.wait_for(demo_client.get_balance(), timeout=3.0)
         await demo_client.disconnect()
         demo_balance = float(getattr(demo_data, 'balance', 10000.00))
 
-        # Fetch Real Account Balance
+        # Attempt Real Balance Retrieval
         real_client = AsyncPocketOptionClient(req.ssid, is_demo=False)
-        await asyncio.wait_for(real_client.connect(), timeout=5.0)
+        await asyncio.wait_for(real_client.connect(), timeout=4.0)
         real_data = await asyncio.wait_for(real_client.get_balance(), timeout=3.0)
         await real_client.disconnect()
         real_balance = float(getattr(real_data, 'balance', 0.00))
 
     except Exception as e:
-        logger.warning(f"Live balance retrieval fallback: {str(e)}")
+        logger.warning(f"Live websocket connection fallback: {str(e)}")
 
     USER_SESSIONS[req.user_id] = {
         "ssid": req.ssid,
@@ -141,13 +140,13 @@ async def get_market_prediction():
 @app.post("/api/trade/execute")
 async def execute_trade(req: TradeExecutionRequest):
     """
-    Executes a market order (CALL/PUT) using the authenticated user's session token.
+    Executes a trade order via Pocket Option API or fallback executor.
     """
     session = USER_SESSIONS.get(req.user_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired or not connected. Please connect your Pocket Option account."
+            detail="No active session found. Please connect your Pocket Option account."
         )
 
     balance_key = "demo_balance" if req.is_demo else "real_balance"
@@ -156,13 +155,13 @@ async def execute_trade(req: TradeExecutionRequest):
     if current_balance < req.amount:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient funds in {'Demo' if req.is_demo else 'Real'} balance."
+            detail=f"Insufficient funds in {'Demo' if req.is_demo else 'Real'} account."
         )
 
     try:
         from pocketoptionapi_async import AsyncPocketOptionClient, OrderDirection
         client = AsyncPocketOptionClient(session["ssid"], is_demo=req.is_demo)
-        await asyncio.wait_for(client.connect(), timeout=5.0)
+        await asyncio.wait_for(client.connect(), timeout=4.0)
 
         direction_enum = OrderDirection.CALL if req.direction.upper() == "CALL" else OrderDirection.PUT
         
@@ -173,15 +172,15 @@ async def execute_trade(req: TradeExecutionRequest):
                 direction=direction_enum,
                 duration=req.duration
             ),
-            timeout=8.0
+            timeout=6.0
         )
         await client.disconnect()
         order_id = getattr(order, 'id', f"ORD-{int(asyncio.get_event_loop().time())}")
     except Exception as e:
-        logger.warning(f"Live trade submission fallback: {str(e)}")
+        logger.warning(f"Trade submission fallback: {str(e)}")
         order_id = f"MOCK-ORD-{int(asyncio.get_event_loop().time())}"
 
-    # Deduct funds locally for fast state updates
+    # Update local cached balance
     session[balance_key] = max(0.0, current_balance - req.amount)
 
     return {
