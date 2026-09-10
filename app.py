@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from typing import Optional, Dict
-from fastapi import FastAPI, HTTPException, Status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
