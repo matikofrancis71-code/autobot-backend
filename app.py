@@ -1,30 +1,20 @@
 import os
-import asyncio
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
+from typing import Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+APP_VERSION = "3.1.0-dynamic-market"
 
-APP_VERSION = "3.0.0-fixed-risk"
-
-# Your Vercel frontend
 FRONTEND_ORIGIN = os.getenv(
     "FRONTEND_ORIGIN",
     "*"
 )
 
-
-# ============================================================
-# FASTAPI
-# ============================================================
 
 app = FastAPI(
     title="Fixed Risk Booster API",
@@ -35,10 +25,6 @@ app = FastAPI(
     )
 )
 
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,16 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ============================================================
-# IN-MEMORY STORAGE
-#
-# This is intentionally the first backend stage.
-#
-# IMPORTANT:
-# Render instance memory is NOT permanent storage.
-# Later we will move account/trade history into a database.
-# ============================================================
 
 USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
@@ -77,13 +53,9 @@ class SessionRegisterRequest(BaseModel):
 class TradingStartRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=128)
 
-    account: str = Field(
-        default="demo"
-    )
+    account: str = Field(default="demo")
 
-    stake: float = Field(
-        gt=0
-    )
+    stake: float = Field(gt=0)
 
     real_market_mode: bool = False
 
@@ -100,13 +72,14 @@ class TradeRequest(BaseModel):
         max_length=64
     )
 
-    amount: float = Field(
-        gt=0
+    direction: str = Field(
+        min_length=1,
+        max_length=16
     )
 
-    account: str = Field(
-        default="demo"
-    )
+    amount: float = Field(gt=0)
+
+    account: str = Field(default="demo")
 
     duration: int = Field(
         default=60,
@@ -116,7 +89,7 @@ class TradeRequest(BaseModel):
 
 
 # ============================================================
-# UTILITY FUNCTIONS
+# UTILITIES
 # ============================================================
 
 def utc_now() -> str:
@@ -130,17 +103,13 @@ def create_user_session(
 ) -> Dict[str, Any]:
 
     return {
-
         "user_id": user_id,
 
         "connected": False,
 
         "connection_status": "not_connected",
 
-        # ----------------------------------------------------
-        # DEMO ACCOUNT
-        # ----------------------------------------------------
-
+        # DEMO
         "demo_balance": 10000.00,
 
         "demo_stats": {
@@ -152,13 +121,7 @@ def create_user_session(
 
         "demo_history": [],
 
-        # ----------------------------------------------------
-        # REAL ACCOUNT
-        #
-        # None means:
-        # "We have NOT received a verified real balance."
-        # ----------------------------------------------------
-
+        # REAL
         "real_balance": None,
 
         "real_stats": {
@@ -170,10 +133,7 @@ def create_user_session(
 
         "real_history": [],
 
-        # ----------------------------------------------------
-        # CURRENT TRADING SESSION
-        # ----------------------------------------------------
-
+        # SESSION
         "trading": False,
 
         "account": "demo",
@@ -197,7 +157,6 @@ def create_user_session(
         "session_started_at": None,
 
         "last_trade_at": None,
-
     }
 
 
@@ -207,20 +166,16 @@ def get_session(
 
     if user_id not in USER_SESSIONS:
 
-        USER_SESSIONS[user_id] = \
+        USER_SESSIONS[user_id] = (
             create_user_session(user_id)
+        )
 
     return USER_SESSIONS[user_id]
 
 
-def validate_account(
-    account: str
-):
+def validate_account(account: str):
 
-    if account not in {
-        "demo",
-        "real"
-    }:
+    if account not in {"demo", "real"}:
 
         raise HTTPException(
             status_code=400,
@@ -244,7 +199,6 @@ def validate_trade_amount(
             detail="Stake must be greater than zero."
         )
 
-
     if account == "demo":
 
         if session["demo_balance"] < amount:
@@ -254,11 +208,9 @@ def validate_trade_amount(
                 detail="Insufficient demo balance."
             )
 
-
     elif account == "real":
 
-        real_balance = \
-            session["real_balance"]
+        real_balance = session["real_balance"]
 
         if real_balance is None:
 
@@ -280,12 +232,18 @@ def validate_trade_amount(
 
 # ============================================================
 # MARKET ENGINE
+#
+# IMPORTANT:
+# The frontend does NOT select a hard-coded market.
+# The backend is the source of the recommendation.
+#
+# This is currently an ANALYSIS PLACEHOLDER.
+# It is NOT a live Pocket Option signal.
 # ============================================================
 
 def get_market_prediction():
 
     return {
-
         "recommended_asset": "EURUSD_otc",
 
         "payout": "92%",
@@ -297,63 +255,60 @@ def get_market_prediction():
         "rsi_value": 28.4,
 
         "reason": (
-            "RSI indicates oversold conditions "
-            "(28.4) with high payout."
+            "Analysis placeholder: live market-data "
+            "provider is not connected yet."
         ),
 
-        "generated_at": utc_now(),
+        "source": "backend_analysis_placeholder",
 
+        "generated_at": utc_now(),
     }
 
 
 def get_markets():
 
-    prediction = \
-        get_market_prediction()
+    prediction = get_market_prediction()
 
-    recommended = \
-        prediction["recommended_asset"]
+    recommended = prediction["recommended_asset"]
 
     markets = [
-
         {
             "asset": recommended,
-            "payout": 92,
-            "confidence": 89.2,
+
+            "payout": float(
+                str(
+                    prediction["payout"]
+                ).replace("%", "")
+            ),
+
+            "confidence": float(
+                prediction["confidence_score"]
+            ),
+
             "favourable": True,
-        },
 
-        {
-            "asset": "GBPUSD_otc",
-            "payout": 88,
-            "confidence": 74.0,
-            "favourable": False,
-        },
-
-        {
-            "asset": "USDJPY_otc",
-            "payout": 85,
-            "confidence": 69.0,
-            "favourable": False,
-        },
-
-        {
-            "asset": "BTCUSD",
-            "payout": 80,
-            "confidence": 66.0,
-            "favourable": False,
-        },
-
+            "predicted_direction":
+                prediction[
+                    "predicted_direction"
+                ],
+        }
     ]
 
     return {
-
         "recommended_asset": recommended,
+
+        "predicted_direction":
+            prediction[
+                "predicted_direction"
+            ],
+
+        "source":
+            prediction.get("source"),
 
         "markets": markets,
 
-        "generated_at": utc_now(),
-
+        "generated_at":
+            prediction["generated_at"],
     }
 
 
@@ -365,32 +320,41 @@ def get_markets():
 async def root():
 
     return {
-
         "status": "online",
 
-        "service": "Fixed Risk Booster API",
+        "service":
+            "Fixed Risk Booster API",
 
-        "version": APP_VERSION,
+        "version":
+            APP_VERSION,
 
-        "time": utc_now(),
-
+        "time":
+            utc_now(),
     }
+
+
+@app.head("/")
+async def root_head():
+
+    return Response(
+        status_code=200
+    )
 
 
 @app.get("/api/health")
 async def health():
 
     return {
-
         "status": "healthy",
 
-        "version": APP_VERSION,
+        "version":
+            APP_VERSION,
 
         "users_in_memory":
             len(USER_SESSIONS),
 
-        "time": utc_now(),
-
+        "time":
+            utc_now(),
     }
 
 
@@ -416,12 +380,6 @@ async def markets():
 
 # ============================================================
 # SESSION REGISTER
-#
-# IMPORTANT:
-# This endpoint currently registers the Mini App user.
-#
-# It does NOT pretend that a Pocket Option account
-# has been authenticated.
 # ============================================================
 
 @app.post(
@@ -431,18 +389,21 @@ async def register_session(
     request: SessionRegisterRequest
 ):
 
-    session = get_session(request.user_id)
+    session = get_session(
+        request.user_id
+    )
 
     session["connected"] = False
 
-    session["connection_status"] = \
+    session["connection_status"] = (
         "not_connected"
+    )
 
     return {
-
         "status": "registered",
 
-        "user_id": request.user_id,
+        "user_id":
+            request.user_id,
 
         "connected": False,
 
@@ -450,13 +411,11 @@ async def register_session(
             "not_connected",
 
         "balances": {
-
             "demo":
                 session["demo_balance"],
 
             "real":
                 session["real_balance"],
-
         },
 
         "message": (
@@ -464,7 +423,6 @@ async def register_session(
             "Pocket Option account has not "
             "been verified."
         ),
-
     }
 
 
@@ -482,8 +440,8 @@ async def session_status(
     session = get_session(user_id)
 
     return {
-
-        "user_id": user_id,
+        "user_id":
+            user_id,
 
         "connected":
             session["connected"],
@@ -493,7 +451,6 @@ async def session_status(
 
         "account":
             session["account"],
-
     }
 
 
@@ -511,16 +468,12 @@ async def account_balance(
     session = get_session(user_id)
 
     return {
-
         "demo": {
-
             "balance":
                 session["demo_balance"],
-
         },
 
         "real": {
-
             "balance":
                 session["real_balance"],
 
@@ -529,14 +482,12 @@ async def account_balance(
                     session["real_balance"]
                     is not None
                 ),
-
         },
-
     }
 
 
 # ============================================================
-# START TRADING SESSION
+# START TRADING
 # ============================================================
 
 @app.post(
@@ -550,13 +501,9 @@ async def start_trading(
         request.account
     )
 
-
-    session = get_session(request.user_id)
-
-
-    # --------------------------------------------------------
-    # Validate real account
-    # --------------------------------------------------------
+    session = get_session(
+        request.user_id
+    )
 
     if request.account == "real":
 
@@ -570,7 +517,6 @@ async def start_trading(
                 )
             )
 
-
         if session["real_balance"] is None:
 
             raise HTTPException(
@@ -580,11 +526,6 @@ async def start_trading(
                     "has not been verified."
                 )
             )
-
-
-    # --------------------------------------------------------
-    # Demo balance validation
-    # --------------------------------------------------------
 
     if request.account == "demo":
 
@@ -600,18 +541,20 @@ async def start_trading(
                 )
             )
 
-
-    # --------------------------------------------------------
-    # Start fresh session
-    # --------------------------------------------------------
-
     session["trading"] = True
 
-    session["account"] = request.account
+    session["account"] = (
+        request.account
+    )
 
-    session["stake"] = round(request.stake, 2)
+    session["stake"] = round(
+        request.stake,
+        2
+    )
 
-    session["real_market_mode"] = request.real_market_mode
+    session["real_market_mode"] = (
+        request.real_market_mode
+    )
 
     session["session_profit"] = 0.0
 
@@ -625,10 +568,11 @@ async def start_trading(
 
     session["active_trade"] = None
 
-    session["session_started_at"] = utc_now()
+    session["session_started_at"] = (
+        utc_now()
+    )
 
     return {
-
         "status": "started",
 
         "account":
@@ -642,12 +586,11 @@ async def start_trading(
 
         "session_started_at":
             session["session_started_at"],
-
     }
 
 
 # ============================================================
-# STOP TRADING SESSION
+# STOP TRADING
 # ============================================================
 
 @app.post(
@@ -657,14 +600,15 @@ async def stop_trading(
     request: TradingStopRequest
 ):
 
-    session = get_session(request.user_id)
+    session = get_session(
+        request.user_id
+    )
 
     session["trading"] = False
 
     session["active_trade"] = None
 
     return {
-
         "status": "stopped",
 
         "account":
@@ -681,7 +625,6 @@ async def stop_trading(
 
         "session_losses":
             session["session_losses"],
-
     }
 
 
@@ -699,7 +642,6 @@ async def trading_status(
     session = get_session(user_id)
 
     return {
-
         "trading":
             session["trading"],
 
@@ -726,23 +668,17 @@ async def trading_status(
 
         "active_trade":
             session["active_trade"],
-
     }
 
 
 # ============================================================
 # DEMO TRADE
-#
-# This is the ONLY place where the backend simulates a
-# result at this stage.
-#
-# Real trades are intentionally blocked until the broker
-# adapter is verified.
 # ============================================================
 
 async def execute_demo_trade(
     session: Dict[str, Any],
     asset: str,
+    direction: str,
     amount: float,
     duration: int
 ):
@@ -753,59 +689,47 @@ async def execute_demo_trade(
         amount
     )
 
-
-    # --------------------------------------------------------
-    # Fixed-risk result
+    # Deterministic result for backend testing.
+    # Odd trade = WIN.
+    # Even trade = LOSS.
     #
-    # 92% payout:
-    # WIN  = +amount * 0.92
-    # LOSS = -amount
-    #
-    # This first backend stage uses a deterministic alternating
-    # demo result for testing the accounting API.
-    #
-    # We can replace this with the actual demo market engine
-    # later.
-    # --------------------------------------------------------
+    # This will later be replaced by the actual
+    # demo market result.
 
-    next_trade_number = session["demo_stats"]["trades"] + 1
+    next_trade_number = (
+        session["demo_stats"]["trades"]
+        + 1
+    )
 
+    is_win = (
+        next_trade_number % 2 == 1
+    )
 
-    is_win = next_trade_number % 2 == 1
+    if is_win:
 
-
-    profit = (
+        profit = (
             amount * 0.92
-            if is_win
-            else -amount
         )
 
+    else:
 
-    # --------------------------------------------------------
-    # Balance
-    # --------------------------------------------------------
+        profit = -amount
 
-    session["demo_balance"] += profit
+    session["demo_balance"] += (
+        profit
+    )
 
-
-    # --------------------------------------------------------
-    # Session statistics
-    # --------------------------------------------------------
-
-    session["session_profit"] += profit
+    session["session_profit"] += (
+        profit
+    )
 
     session["session_trades"] += 1
 
-
-    # --------------------------------------------------------
-    # All-time Demo statistics
-    # --------------------------------------------------------
-
-    session["demo_stats"]["profit"] += \
+    session["demo_stats"]["profit"] += (
         profit
+    )
 
     session["demo_stats"]["trades"] += 1
-
 
     if is_win:
 
@@ -827,49 +751,59 @@ async def execute_demo_trade(
 
         result = "LOSS"
 
+    order_id = (
+        "DEMO-"
+        + uuid.uuid4().hex[:12].upper()
+    )
 
-    order_id = "DEMO-" + uuid.uuid4().hex[:12].upper()
-
+    timestamp = utc_now()
 
     trade = {
+        "order_id":
+            order_id,
 
-        "order_id": order_id,
+        "account":
+            "demo",
 
-        "account": "demo",
+        "asset":
+            asset,
 
-        "asset": asset,
+        "direction":
+            direction,
 
-        "stake": amount,
+        "stake":
+            amount,
 
-        "duration": duration,
+        "duration":
+            duration,
 
-        "result": result,
+        "result":
+            result,
 
-        "profit": round(
-            profit,
-            2
-        ),
+        "profit":
+            round(
+                profit,
+                2
+            ),
 
-        "timestamp": utc_now(),
-
+        "timestamp":
+            timestamp,
     }
-
 
     session["demo_history"].insert(
         0,
         trade
     )
 
+    session["demo_history"] = (
+        session["demo_history"][:100]
+    )
 
-    session["demo_history"] = session["demo_history"][:100]
+    session["last_trade_at"] = (
+        timestamp
+    )
 
-
-    session["last_trade_at"] = trade["timestamp"]
-
-
-    # --------------------------------------------------------
-    # Three-loss protection
-    # --------------------------------------------------------
+    protection_message = None
 
     if (
         session["consecutive_losses"]
@@ -884,29 +818,33 @@ async def execute_demo_trade(
             "protect balance"
         )
 
-    else:
-
-        protection_message = None
-
-
     return {
+        "status":
+            "completed",
 
-        "status": "completed",
+        "order_id":
+            order_id,
 
-        "order_id": order_id,
+        "account":
+            "demo",
 
-        "account": "demo",
+        "asset":
+            asset,
 
-        "asset": asset,
+        "direction":
+            direction,
 
-        "stake": amount,
+        "stake":
+            amount,
 
-        "result": result,
+        "result":
+            result,
 
-        "profit": round(
-            profit,
-            2
-        ),
+        "profit":
+            round(
+                profit,
+                2
+            ),
 
         "remaining_balance":
             round(
@@ -937,19 +875,19 @@ async def execute_demo_trade(
 
         "protection_message":
             protection_message,
-
     }
 
 
 # ============================================================
-# REAL TRADE PLACEHOLDER
+# REAL TRADE
 #
-# We deliberately DO NOT fake a real order.
+# INTENTIONALLY BLOCKED.
 # ============================================================
 
 async def execute_real_trade(
     session: Dict[str, Any],
     asset: str,
+    direction: str,
     amount: float,
     duration: int
 ):
@@ -980,13 +918,9 @@ async def execute_trade(
         request.account
     )
 
-
-    session = get_session(request.user_id)
-
-
-    # --------------------------------------------------------
-    # Trading must have been started
-    # --------------------------------------------------------
+    session = get_session(
+        request.user_id
+    )
 
     if not session["trading"]:
 
@@ -997,23 +931,36 @@ async def execute_trade(
             )
         )
 
+    # Ensure the request account matches
+    # the account used to start the session.
 
-    # --------------------------------------------------------
-    # Fixed stake enforcement
-    #
-    # Once a session starts, every trade must use exactly
-    # the opening stake.
-    # --------------------------------------------------------
+    if request.account != session["account"]:
 
-    opening_stake = session["stake"]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Account mismatch: the trade "
+                "account must match the active "
+                "trading session."
+            )
+        )
 
+    # Fixed-risk enforcement.
 
-    if round(
-        request.amount,
-        2
-    ) != round(
-        opening_stake,
-        2
+    opening_stake = (
+        session["stake"]
+    )
+
+    if (
+        round(
+            request.amount,
+            2
+        )
+        !=
+        round(
+            opening_stake,
+            2
+        )
     ):
 
         raise HTTPException(
@@ -1026,40 +973,110 @@ async def execute_trade(
             )
         )
 
+    # --------------------------------------------------------
+    # CURRENT BACKEND MARKET RECOMMENDATION
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
+    prediction = (
+        get_market_prediction()
+    )
+
+    recommended_asset = (
+        prediction[
+            "recommended_asset"
+        ]
+    )
+
+    predicted_direction = (
+        prediction[
+            "predicted_direction"
+        ]
+    )
+
+    # Reject stale/wrong market.
+
+    if (
+        request.asset
+        !=
+        recommended_asset
+    ):
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message":
+                    "Market recommendation "
+                    "is stale or invalid.",
+
+                "recommended_asset":
+                    recommended_asset,
+
+                "predicted_direction":
+                    predicted_direction,
+
+                "generated_at":
+                    prediction[
+                        "generated_at"
+                    ],
+            },
+        )
+
+    # Reject stale/wrong direction.
+
+    if (
+        request.direction
+        !=
+        predicted_direction
+    ):
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message":
+                    "Prediction direction "
+                    "is stale or invalid.",
+
+                "recommended_asset":
+                    recommended_asset,
+
+                "predicted_direction":
+                    predicted_direction,
+
+                "generated_at":
+                    prediction[
+                        "generated_at"
+                    ],
+            },
+        )
+
     # DEMO
-    # --------------------------------------------------------
 
     if request.account == "demo":
 
         return await execute_demo_trade(
-
             session=session,
 
             asset=request.asset,
 
+            direction=request.direction,
+
             amount=opening_stake,
 
             duration=request.duration,
-
         )
 
-
-    # --------------------------------------------------------
     # REAL
-    # --------------------------------------------------------
 
     return await execute_real_trade(
-
         session=session,
 
         asset=request.asset,
 
+        direction=request.direction,
+
         amount=opening_stake,
 
         duration=request.duration,
-
     )
 
 
@@ -1077,24 +1094,28 @@ async def trade_history(
 
     validate_account(account)
 
-    session = get_session(user_id)
-
+    session = get_session(
+        user_id
+    )
 
     if account == "demo":
 
-        history = session["demo_history"]
+        history = (
+            session["demo_history"]
+        )
 
     else:
 
-        history = session["real_history"]
-
+        history = (
+            session["real_history"]
+        )
 
     return {
+        "account":
+            account,
 
-        "account": account,
-
-        "trades": history,
-
+        "trades":
+            history,
     }
 
 
@@ -1112,29 +1133,27 @@ async def statistics(
 
     validate_account(account)
 
-    session = get_session(user_id)
-
+    session = get_session(
+        user_id
+    )
 
     if account == "demo":
 
-        stats = session["demo_stats"]
-
-        trades = stats["trades"]
-
-        wins = stats["wins"]
-
-        profit = stats["profit"]
+        stats = (
+            session["demo_stats"]
+        )
 
     else:
 
-        stats = session["real_stats"]
+        stats = (
+            session["real_stats"]
+        )
 
-        trades = stats["trades"]
+    trades = stats["trades"]
 
-        wins = stats["wins"]
+    wins = stats["wins"]
 
-        profit = stats["profit"]
-
+    profit = stats["profit"]
 
     if (
         trades is None
@@ -1150,33 +1169,30 @@ async def statistics(
     else:
 
         win_rate = round(
-                wins /
-                trades *
-                100,
-                2
-            )
-
+            wins /
+            trades *
+            100,
+            2
+        )
 
     return {
+        "account":
+            account,
 
-        "account": account,
+        "profit":
+            profit,
 
-        "profit": profit,
+        "trades":
+            trades,
 
-        "trades": trades,
-
-        "wins": wins,
+        "wins":
+            wins,
 
         "losses":
-            (
-                stats["losses"]
-                if stats["losses"] is not None
-                else None
-            ),
+            stats["losses"],
 
         "win_rate":
             win_rate,
-
     }
 
 
@@ -1189,11 +1205,11 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(
-            os.getenv(
-                "PORT",
-                "10000"
-            )
+        os.getenv(
+            "PORT",
+            "10000"
         )
+    )
 
     uvicorn.run(
         app,
