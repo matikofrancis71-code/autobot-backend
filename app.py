@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.2.2-live-market-timezone-fix"
+APP_VERSION = "3.2.3-live-market-timezone-debug"
 
 # Your Vercel frontend
 FRONTEND_ORIGIN = os.getenv(
@@ -445,16 +445,21 @@ def _analyze_candles(symbol: str, values: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
-def _parse_twelve_data_candle_time(candle_time: str) -> datetime:
-    """Parse a Twelve Data forex candle timestamp into aware UTC time."""
+def _parse_candle_time_utc(candle_time: str) -> datetime:
+    """
+    Convert a Twelve Data candle timestamp to an aware UTC datetime.
+
+    Twelve Data can return a naive forex timestamp. When no timezone
+    information is present, interpret it in Australia/Sydney (the
+    provider's documented default forex timezone). If an explicit
+    offset is present, respect that offset.
+    """
     if not isinstance(candle_time, str) or not candle_time.strip():
         raise ValueError("Invalid candle timestamp.")
 
     raw = candle_time.strip().replace("Z", "+00:00")
     dt = datetime.fromisoformat(raw)
 
-    # Twelve Data can return naive forex timestamps in its default
-    # Australia/Sydney timezone. Never silently interpret those as UTC.
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=ZoneInfo("Australia/Sydney"))
 
@@ -463,15 +468,16 @@ def _parse_twelve_data_candle_time(candle_time: str) -> datetime:
 
 def _is_fresh_candle(candle_time: str) -> bool:
     try:
-        dt_utc = _parse_twelve_data_candle_time(candle_time)
-        age = (datetime.now(timezone.utc) - dt_utc).total_seconds()
+        dt_utc = _parse_candle_time_utc(candle_time)
+        age = (
+            datetime.now(timezone.utc) - dt_utc
+        ).total_seconds()
 
-        # Allow small provider/server clock differences, but reject genuinely
-        # old candles and timestamps that are materially in the future.
-        return age >= -30 and age <= STALE_AFTER_SECONDS
+        # Allow modest provider/server clock skew while still rejecting
+        # genuinely stale data.
+        return -30 <= age <= STALE_AFTER_SECONDS
     except (TypeError, ValueError):
         return False
-
 
 def _analyze_live_markets() -> Dict[str, Any]:
     global LIVE_CACHE
@@ -541,6 +547,7 @@ def get_market_prediction() -> Dict[str, Any]:
             "rsi_value": None,
             "price": None,
             "reason": data.get("error", "Live market data unavailable."),
+            "data_errors": data.get("errors", [])[:3],
             "source": "twelve_data_live",
             "generated_at": utc_now(),
         }
@@ -637,6 +644,21 @@ async def health():
 async def market_prediction():
 
     return get_market_prediction()
+
+
+@app.get(
+    "/api/market/debug"
+)
+async def market_debug():
+    data = _analyze_live_markets()
+    return {
+        "status": data.get("status"),
+        "market_count": len(data.get("markets", [])),
+        "errors": data.get("errors", [])[:8],
+        "message": data.get("error", "Live market data available."),
+        "generated_at": utc_now(),
+        "api_key_configured": bool(TWELVE_DATA_API_KEY),
+    }
 
 
 @app.get(
