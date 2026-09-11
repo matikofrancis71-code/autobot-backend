@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List, Any
 
 from fastapi import FastAPI, HTTPException
@@ -19,7 +20,7 @@ from pydantic import BaseModel, Field
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.2.0-live-market"
+APP_VERSION = "3.2.2-live-market-timezone-fix"
 
 # Your Vercel frontend
 FRONTEND_ORIGIN = os.getenv(
@@ -444,14 +445,30 @@ def _analyze_candles(symbol: str, values: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+def _parse_twelve_data_candle_time(candle_time: str) -> datetime:
+    """Parse a Twelve Data forex candle timestamp into aware UTC time."""
+    if not isinstance(candle_time, str) or not candle_time.strip():
+        raise ValueError("Invalid candle timestamp.")
+
+    raw = candle_time.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(raw)
+
+    # Twelve Data can return naive forex timestamps in its default
+    # Australia/Sydney timezone. Never silently interpret those as UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("Australia/Sydney"))
+
+    return dt.astimezone(timezone.utc)
+
+
 def _is_fresh_candle(candle_time: str) -> bool:
     try:
-        raw = candle_time.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
-        return age >= -5 and age <= STALE_AFTER_SECONDS
+        dt_utc = _parse_twelve_data_candle_time(candle_time)
+        age = (datetime.now(timezone.utc) - dt_utc).total_seconds()
+
+        # Allow small provider/server clock differences, but reject genuinely
+        # old candles and timestamps that are materially in the future.
+        return age >= -30 and age <= STALE_AFTER_SECONDS
     except (TypeError, ValueError):
         return False
 
