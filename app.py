@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.2.0-live-market"
+APP_VERSION = "3.2.1-live-market-debug"
 
 # Your Vercel frontend
 FRONTEND_ORIGIN = os.getenv(
@@ -521,6 +521,7 @@ def get_market_prediction() -> Dict[str, Any]:
             "rsi_value": None,
             "price": None,
             "reason": data.get("error", "Live market data unavailable."),
+            "data_errors": data.get("errors", [])[:3],
             "source": "twelve_data_live",
             "generated_at": utc_now(),
         }
@@ -610,6 +611,22 @@ async def health():
 # ============================================================
 # MARKET ENDPOINTS
 # ============================================================
+
+@app.get(
+    "/api/market/debug"
+)
+async def market_debug():
+    """Safe Twelve Data diagnostics. Never returns the API key."""
+    data = _analyze_live_markets()
+    return {
+        "status": data.get("status"),
+        "market_count": len(data.get("markets", [])),
+        "errors": data.get("errors", []),
+        "message": data.get("error"),
+        "generated_at": data.get("generated_at", utc_now()),
+        "api_key_configured": bool(TWELVE_DATA_API_KEY),
+    }
+
 
 @app.get(
     "/api/market/prediction"
