@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 import uuid
 import json
 import math
@@ -303,8 +304,12 @@ MARKET_PAIRS = [
 LIVE_CANDLE_INTERVAL = "1min"
 CANDLE_OUTPUTSIZE = 60
 STALE_AFTER_SECONDS = 150
-LIVE_CACHE_SECONDS = 20
+# Twelve Data rate-limit protection. One refresh of all 8 pairs costs 8 credits.
+LIVE_CACHE_SECONDS = 75
+LIVE_STALE_GRACE_SECONDS = 180
 LIVE_CACHE = {"expires_at": 0.0, "data": None}
+LAST_GOOD_LIVE_DATA = {"data": None, "saved_at": 0.0}
+LIVE_REFRESH_LOCK = threading.Lock()
 
 
 def _fetch_json(url: str) -> Dict[str, Any]:
@@ -483,67 +488,173 @@ def _is_fresh_candle(candle_time: str) -> bool:
         return False
 
 def _analyze_live_markets() -> Dict[str, Any]:
-    global LIVE_CACHE
+    """Analyze live forex markets with controlled Twelve Data refreshing."""
+    global LIVE_CACHE, LAST_GOOD_LIVE_DATA
 
     now_ts = datetime.now(timezone.utc).timestamp()
+
+    # Fast path: serve the current cached snapshot.
     if LIVE_CACHE["data"] is not None and now_ts < LIVE_CACHE["expires_at"]:
         return LIVE_CACHE["data"]
 
-    if not TWELVE_DATA_API_KEY:
+    # Prevent simultaneous requests from creating multiple 8-request
+    # Twelve Data refreshes.
+    with LIVE_REFRESH_LOCK:
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        if LIVE_CACHE["data"] is not None and now_ts < LIVE_CACHE["expires_at"]:
+            return LIVE_CACHE["data"]
+
+        if not TWELVE_DATA_API_KEY:
+            result = {
+                "status": "unavailable",
+                "error": (
+                    "Live market data is not configured. Add "
+                    "TWELVE_DATA_API_KEY to the Render environment."
+                ),
+                "markets": [],
+                "errors": [],
+            }
+            LIVE_CACHE = {
+                "expires_at": now_ts + LIVE_CACHE_SECONDS,
+                "data": result,
+            }
+            return result
+
+        analyses = []
+        errors = []
+        rate_limited = False
+
+        for symbol in MARKET_PAIRS:
+            try:
+                payload = _fetch_pair(symbol)
+                analysis = _analyze_candles(symbol, payload["values"])
+
+                if not _is_fresh_candle(analysis["candle_time"]):
+                    parsed_utc = _parse_candle_time_utc(
+                        analysis["candle_time"]
+                    )
+                    age_seconds = (
+                        datetime.now(timezone.utc) - parsed_utc
+                    ).total_seconds()
+                    raise RuntimeError(
+                        f"Latest candle for {symbol} is stale "
+                        f"({analysis['candle_time']}; "
+                        f"interpreted_utc={parsed_utc.isoformat()}; "
+                        f"age_seconds={age_seconds:.1f})."
+                    )
+
+                analyses.append(analysis)
+
+            except HTTPError as exc:
+                if exc.code == 429:
+                    rate_limited = True
+                    errors.append({
+                        "symbol": symbol,
+                        "error": "HTTP Error 429: Too Many Requests",
+                    })
+                    # Stop immediately. Do not spend more requests while
+                    # Twelve Data is already rate-limiting us.
+                    break
+
+                errors.append({
+                    "symbol": symbol,
+                    "error": str(exc)[:180],
+                })
+
+            except (
+                URLError,
+                TimeoutError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                errors.append({
+                    "symbol": symbol,
+                    "error": str(exc)[:180],
+                })
+
+            except Exception as exc:
+                errors.append({
+                    "symbol": symbol,
+                    "error": str(exc)[:180],
+                })
+
+        # At least one fresh pair was obtained. Save the complete snapshot
+        # as the latest known-good live data.
+        if analyses:
+            analyses.sort(
+                key=lambda x: (
+                    x["confidence"],
+                    abs(x["momentum_pct"]),
+                ),
+                reverse=True,
+            )
+
+            for index, item in enumerate(analyses):
+                item["favourable"] = index == 0
+                item["payout"] = None
+
+            result = {
+                "status": "live",
+                "markets": analyses,
+                "errors": errors,
+                "generated_at": utc_now(),
+            }
+
+            LIVE_CACHE = {
+                "expires_at": now_ts + LIVE_CACHE_SECONDS,
+                "data": result,
+            }
+
+            LAST_GOOD_LIVE_DATA = {
+                "data": result,
+                "saved_at": now_ts,
+            }
+
+            return result
+
+        # If Twelve Data temporarily rate-limited us, serve the last
+        # successful live snapshot instead of making the market disappear.
+        last_good = LAST_GOOD_LIVE_DATA.get("data")
+        last_good_at = LAST_GOOD_LIVE_DATA.get("saved_at", 0.0)
+
+        if (
+            rate_limited
+            and last_good is not None
+            and (now_ts - last_good_at) <= LIVE_STALE_GRACE_SECONDS
+        ):
+            fallback = dict(last_good)
+            fallback["served_from_cache"] = True
+            fallback["rate_limited"] = True
+            fallback["cache_age_seconds"] = round(
+                now_ts - last_good_at,
+                1,
+            )
+            fallback["errors"] = errors
+
+            LIVE_CACHE = {
+                "expires_at": now_ts + LIVE_CACHE_SECONDS,
+                "data": fallback,
+            }
+
+            return fallback
+
         result = {
             "status": "unavailable",
-            "error": "Live market data is not configured. Add TWELVE_DATA_API_KEY to the Render environment.",
-            "markets": [],
-        }
-        LIVE_CACHE = {"expires_at": now_ts + LIVE_CACHE_SECONDS, "data": result}
-        return result
-
-    analyses = []
-    errors = []
-    for symbol in MARKET_PAIRS:
-        try:
-            payload = _fetch_pair(symbol)
-            analysis = _analyze_candles(symbol, payload["values"])
-            if not _is_fresh_candle(analysis["candle_time"]):
-                parsed_utc = _parse_candle_time_utc(analysis["candle_time"])
-                age_seconds = (
-                    datetime.now(timezone.utc) - parsed_utc
-                ).total_seconds()
-                raise RuntimeError(
-                    f"Latest candle for {symbol} is stale "
-                    f"({analysis['candle_time']}; interpreted_utc="
-                    f"{parsed_utc.isoformat()}; age_seconds={age_seconds:.1f})."
-                )
-            analyses.append(analysis)
-        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
-            errors.append({"symbol": symbol, "error": str(exc)[:180]})
-        except Exception as exc:
-            errors.append({"symbol": symbol, "error": str(exc)[:180]})
-
-    if not analyses:
-        result = {
-            "status": "unavailable",
-            "error": "No live market data could be retrieved from Twelve Data.",
+            "error": (
+                "No live market data could be retrieved from Twelve Data."
+            ),
             "markets": [],
             "errors": errors,
         }
-        LIVE_CACHE = {"expires_at": now_ts + 5, "data": result}
+
+        # Cool down before another attempted refresh.
+        LIVE_CACHE = {
+            "expires_at": now_ts + LIVE_CACHE_SECONDS,
+            "data": result,
+        }
+
         return result
-
-    # Favor stronger confidence first, then stronger absolute momentum.
-    analyses.sort(key=lambda x: (x["confidence"], abs(x["momentum_pct"])), reverse=True)
-    for index, item in enumerate(analyses):
-        item["favourable"] = index == 0
-        item["payout"] = None  # Twelve Data is not a Pocket Option payout feed.
-
-    result = {
-        "status": "live",
-        "markets": analyses,
-        "errors": errors,
-        "generated_at": utc_now(),
-    }
-    LIVE_CACHE = {"expires_at": now_ts + LIVE_CACHE_SECONDS, "data": result}
-    return result
 
 
 def get_market_prediction() -> Dict[str, Any]:
