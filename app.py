@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.2.3-live-market-timezone-debug"
+APP_VERSION = "3.2.4-live-market-utc-fix"
 
 # Your Vercel frontend
 FRONTEND_ORIGIN = os.getenv(
@@ -461,7 +461,10 @@ def _parse_candle_time_utc(candle_time: str) -> datetime:
     dt = datetime.fromisoformat(raw)
 
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("Australia/Sydney"))
+        # _fetch_pair() explicitly requests timezone=UTC from Twelve Data.
+        # Therefore a naive timestamp in this response must be interpreted
+        # as UTC, not as the provider's default Australia/Sydney timezone.
+        dt = dt.replace(tzinfo=timezone.utc)
 
     return dt.astimezone(timezone.utc)
 
@@ -502,7 +505,15 @@ def _analyze_live_markets() -> Dict[str, Any]:
             payload = _fetch_pair(symbol)
             analysis = _analyze_candles(symbol, payload["values"])
             if not _is_fresh_candle(analysis["candle_time"]):
-                raise RuntimeError(f"Latest candle for {symbol} is stale ({analysis['candle_time']}).")
+                parsed_utc = _parse_candle_time_utc(analysis["candle_time"])
+                age_seconds = (
+                    datetime.now(timezone.utc) - parsed_utc
+                ).total_seconds()
+                raise RuntimeError(
+                    f"Latest candle for {symbol} is stale "
+                    f"({analysis['candle_time']}; interpreted_utc="
+                    f"{parsed_utc.isoformat()}; age_seconds={age_seconds:.1f})."
+                )
             analyses.append(analysis)
         except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
             errors.append({"symbol": symbol, "error": str(exc)[:180]})
