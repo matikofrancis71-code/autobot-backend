@@ -1,41 +1,40 @@
-import os
+# ============================================================
+# FIXED RISK BOOSTER
+# Deriv Options Multi-User Backend
+# Version: 6.0.0
+# ============================================================
+
 import asyncio
 import base64
 import hashlib
 import json
 import math
+import os
 import secrets
+import statistics
 import time
+import urllib.parse
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
-from urllib.parse import urlencode
+from typing import Any, Dict, List, Optional, Tuple
 
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-
-from fastapi import FastAPI, HTTPException
+import httpx
+import websockets
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-try:
-    import websockets
-except ImportError as exc:
-    raise RuntimeError(
-        "The websockets package is required. Add websockets to requirements.txt."
-    ) from exc
-
 
 # ============================================================
-# CONFIG
+# ENVIRONMENT
 # ============================================================
 
-APP_VERSION = "5.0.0-multi-user-options"
+APP_VERSION = "6.0.0"
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*").strip()
+FRONTEND_ORIGIN = (
+    os.getenv("FRONTEND_ORIGIN", "").strip().rstrip("/")
+)
 
 DERIV_CLIENT_ID = os.getenv("DERIV_CLIENT_ID", "").strip()
-DERIV_CLIENT_SECRET = os.getenv("DERIV_CLIENT_SECRET", "").strip()
 DERIV_REDIRECT_URI = os.getenv("DERIV_REDIRECT_URI", "").strip()
 
 DERIV_REST_BASE = "https://api.derivws.com"
@@ -47,67 +46,51 @@ DERIV_PUBLIC_WS = (
 
 DERIV_OAUTH_SCOPE = "trade"
 
-# ------------------------------------------------------------
-# Prediction settings
-# ------------------------------------------------------------
+# Safety: real trading is disabled unless explicitly enabled.
+REAL_TRADING_ENABLED = (
+    os.getenv("REAL_TRADING_ENABLED", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
 
 HISTORY_TICKS = int(os.getenv("HISTORY_TICKS", "2500"))
 PREDICTION_HORIZON_TICKS = int(
     os.getenv("PREDICTION_HORIZON_TICKS", "5")
 )
-
 MIN_BACKTEST_SAMPLES = int(
     os.getenv("MIN_BACKTEST_SAMPLES", "150")
 )
-
 MIN_EDGE_ACCURACY = float(
     os.getenv("MIN_EDGE_ACCURACY", "58")
 )
-
 MIN_CONFIDENCE_TO_TRADE = float(
     os.getenv("MIN_CONFIDENCE_TO_TRADE", "62")
 )
-
 MAX_SYMBOLS_TO_ANALYZE = int(
     os.getenv("MAX_SYMBOLS_TO_ANALYZE", "10")
 )
-
-PREDICTION_CACHE_SECONDS = int(
+PREDICTION_CACHE_SECONDS = float(
     os.getenv("PREDICTION_CACHE_SECONDS", "5")
 )
 
 DEFAULT_DURATION = int(
-    os.getenv(
-        "DEFAULT_DURATION",
-        str(PREDICTION_HORIZON_TICKS)
-    )
+    os.getenv("DEFAULT_DURATION", "5")
 )
-
 DEFAULT_DURATION_UNIT = os.getenv(
-    "DEFAULT_DURATION_UNIT",
-    "t"
-).strip()
+    "DEFAULT_DURATION_UNIT", "t"
+).strip() or "t"
 
-# ------------------------------------------------------------
-# Safety
-# ------------------------------------------------------------
-
-REAL_TRADING_ENABLED = (
-    os.getenv("REAL_TRADING_ENABLED", "true").lower()
-    == "true"
-)
-
-MAX_HISTORY_PER_ACCOUNT = int(
-    os.getenv("MAX_HISTORY_PER_ACCOUNT", "100")
+DEFAULT_BARRIER = int(
+    os.getenv("DEFAULT_BARRIER", "5")
 )
 
 MAX_STAKE = float(
     os.getenv("MAX_STAKE", "1000")
 )
 
-MAX_CONSECUTIVE_LOSSES = int(
-    os.getenv("MAX_CONSECUTIVE_LOSSES", "3")
-)
+MAX_HISTORY_RECORDS = 100
+
+# Session-level safety:
+MAX_CONSECUTIVE_LOSSES = 3
 
 
 # ============================================================
@@ -117,20 +100,17 @@ MAX_CONSECUTIVE_LOSSES = int(
 app = FastAPI(
     title="Fixed Risk Booster API",
     version=APP_VERSION,
-    description=(
-        "Multi-user Deriv Options trading backend with "
-        "OAuth authentication, Demo/Real account separation, "
-        "live market analysis and fixed-risk execution."
-    ),
+    description="Multi-user Deriv Options trading backend.",
 )
+
+allowed_origins = []
+
+if FRONTEND_ORIGIN:
+    allowed_origins.append(FRONTEND_ORIGIN)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=(
-        ["*"]
-        if FRONTEND_ORIGIN == "*"
-        else [FRONTEND_ORIGIN]
-    ),
+    allow_origins=allowed_origins or ["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -138,112 +118,98 @@ app.add_middleware(
 
 
 # ============================================================
-# IN-MEMORY STATE
+# IN-MEMORY STORAGE
 # ============================================================
 #
-# This version deliberately keeps state in memory while we develop.
+# MVP NOTE:
+# Render restarts will clear these dictionaries.
+# For production, replace these with Redis/PostgreSQL.
 #
-# BEFORE PUBLIC PRODUCTION:
-#   - move sessions into Redis/PostgreSQL
-#   - encrypt OAuth tokens at rest
-#   - add proper persistent authentication
-#   - add token refresh handling
-#
-# Each session has its own:
-#   OAuth token
-#   Demo account
-#   Real account
-#   Demo stats
-#   Real stats
-#   Demo history
-#   Real history
-#   trading state
-#   active trade
-#
-# ============================================================
 
 USER_SESSIONS: Dict[str, Dict[str, Any]] = {}
-
 OAUTH_STATES: Dict[str, Dict[str, Any]] = {}
-
-PREDICTION_CACHE: Dict[str, Any] = {
-    "expires_at": 0.0,
-    "data": None,
-}
+PREDICTION_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 # ============================================================
-# REQUEST MODELS
+# MODELS
 # ============================================================
-
-class SessionRegisterRequest(BaseModel):
-    user_id: str = Field(
-        min_length=8,
-        max_length=128
-    )
-
 
 class TradingStartRequest(BaseModel):
-    user_id: str = Field(
-        min_length=8,
-        max_length=128
+    session_id: str = Field(
+        min_length=20,
+        max_length=256,
     )
 
     account: str = Field(
-        default="demo"
+        default="demo",
+        pattern="^(demo|real)$",
     )
 
     stake: float = Field(
+        default=2,
         gt=0,
-        le=MAX_STAKE
+        le=MAX_STAKE,
+    )
+
+    duration: int = Field(
+        default=DEFAULT_DURATION,
+        ge=1,
+        le=100,
     )
 
     real_market_mode: bool = False
 
-    duration: int = Field(
-        default=DEFAULT_DURATION,
-        gt=0,
-        le=60
-    )
-
 
 class TradingStopRequest(BaseModel):
-    user_id: str = Field(
-        min_length=8,
-        max_length=128
+    session_id: str = Field(
+        min_length=20,
+        max_length=256,
     )
 
 
 class TradeRequest(BaseModel):
-    user_id: str = Field(
-        min_length=8,
-        max_length=128
+    session_id: str = Field(
+        min_length=20,
+        max_length=256,
     )
 
     asset: str = Field(
         min_length=1,
-        max_length=64
+        max_length=100,
+    )
+
+    direction: str = Field(
+        pattern="^(OVER|UNDER|NO TRADE)$",
     )
 
     amount: float = Field(
         gt=0,
-        le=MAX_STAKE
+        le=MAX_STAKE,
     )
 
     account: str = Field(
-        default="demo"
+        default="demo",
+        pattern="^(demo|real)$",
     )
 
     duration: int = Field(
         default=DEFAULT_DURATION,
-        gt=0,
-        le=60
+        ge=1,
+        le=100,
     )
 
-    direction: str = Field(
-        default="CALL",
-        min_length=3,
-        max_length=4
+    barrier: int = Field(
+        default=DEFAULT_BARRIER,
+        ge=0,
+        le=9,
+    )
+
+
+class DisconnectRequest(BaseModel):
+    session_id: str = Field(
+        min_length=20,
+        max_length=256,
     )
 
 
@@ -251,7 +217,7 @@ class TradeRequest(BaseModel):
 # BASIC HELPERS
 # ============================================================
 
-def utc_now() -> str:
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -259,288 +225,296 @@ def create_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-def get_session(user_id: str) -> Dict[str, Any]:
-    """
-    Create a completely isolated session for a user.
-
-    user_id is an application session identifier.
-    It is NOT a Deriv account number.
-    """
-
-    if user_id not in USER_SESSIONS:
-        USER_SESSIONS[user_id] = {
-            "user_id": user_id,
-
-            # Authentication
-            "connected": False,
-            "connection_status": "not_connected",
-            "oauth_access_token": None,
-            "oauth_refresh_token": None,
-            "oauth_expires_at": None,
-
-            # Deriv Options accounts
-            "accounts": {
-                "demo": None,
-                "real": None,
-            },
-
-            # Current balances
-            "balances": {
-                "demo": None,
-                "real": None,
-            },
-
-            # Permanent-ish in-memory statistics
-            "demo_stats": {
-                "profit": 0.0,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-            },
-
-            "real_stats": {
-                "profit": 0.0,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-            },
-
-            # Separate histories
-            "demo_history": [],
-            "real_history": [],
-
-            # Trading state
-            "trading": False,
-            "account": "demo",
-            "stake": 2.00,
-            "duration": DEFAULT_DURATION,
-            "real_market_mode": False,
-
-            # Current session statistics
-            "session_profit": 0.0,
-            "session_trades": 0,
-            "session_wins": 0,
-            "session_losses": 0,
-
-            "consecutive_losses": 0,
-
-            # Currently executing/bought contract
-            "active_trade": None,
-
-            "session_started_at": None,
-            "last_trade_at": None,
-
-            # Prevent two trades from being executed
-            # simultaneously for one user.
-            "trade_lock": asyncio.Lock(),
-        }
-
-    return USER_SESSIONS[user_id]
-
-
-def require_session(user_id: str) -> Dict[str, Any]:
-    session = USER_SESSIONS.get(user_id)
-
-    if not session:
-        raise HTTPException(
-            status_code=404,
-            detail="Application session not found. Register the Mini App session first.",
-        )
-
-    return session
-
-
-def validate_account(account: str) -> None:
-    if account not in {"demo", "real"}:
-        raise HTTPException(
-            status_code=400,
-            detail="account must be either 'demo' or 'real'",
-        )
+def random_req_id() -> int:
+    return secrets.randbelow(900000) + 100000
 
 
 def safe_float(
     value: Any,
-    default: Optional[float] = None
+    default: Optional[float] = None,
 ) -> Optional[float]:
-
     try:
+        if value is None:
+            return default
+
+        if isinstance(value, bool):
+            return default
+
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-# ============================================================
-# DERIV REST
-# ============================================================
+def safe_int(
+    value: Any,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    try:
+        if value is None:
+            return default
 
-def deriv_rest(
-    method: str,
-    path: str,
-    access_token: str,
-    body: Optional[Dict[str, Any]] = None,
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(
+    value: float,
+    low: float,
+    high: float,
+) -> float:
+    return max(low, min(high, value))
+
+
+def clean_symbol(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def require_session(
+    session_id: str,
 ) -> Dict[str, Any]:
 
-    url = f"{DERIV_REST_BASE}{path}"
+    session = USER_SESSIONS.get(session_id)
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "User-Agent": "FixedRiskBooster/5.0",
-    }
-
-    data = None
-
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-
-    req = Request(
-        url,
-        method=method.upper(),
-        headers=headers,
-        data=data,
-    )
-
-    try:
-        with urlopen(req, timeout=20) as response:
-
-            raw = response.read().decode("utf-8")
-
-            return (
-                json.loads(raw)
-                if raw
-                else {}
-            )
-
-    except HTTPError as exc:
-
-        raw = exc.read().decode(
-            "utf-8",
-            errors="replace"
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found or expired.",
         )
 
-        try:
-            detail = json.loads(raw)
-        except Exception:
-            detail = raw
-
-        raise RuntimeError(
-            f"Deriv REST {exc.code}: {detail}"
-        ) from exc
-
-    except (URLError, TimeoutError) as exc:
-
-        raise RuntimeError(
-            f"Deriv REST connection error: {exc}"
-        ) from exc
+    return session
 
 
-def get_deriv_accounts(
-    access_token: str
-) -> List[Dict[str, Any]]:
-
-    result = deriv_rest(
-        "GET",
-        "/trading/v1/options/accounts",
-        access_token,
+def is_connected(
+    session: Dict[str, Any],
+) -> bool:
+    return bool(
+        session.get("connected")
+        and session.get("access_token")
     )
 
-    data = result.get(
-        "data",
-        result.get("accounts", [])
-    )
 
-    if isinstance(data, dict):
-        data = [data]
+def account_id_for(
+    session: Dict[str, Any],
+    account: str,
+) -> Optional[str]:
 
-    if not isinstance(data, list):
-        raise RuntimeError(
-            "Deriv returned an unexpected accounts response."
-        )
-
-    return data
+    return session.get("accounts", {}).get(account)
 
 
-def get_account_from_list(
-    accounts: List[Dict[str, Any]],
-    account_type: str
-) -> Optional[Dict[str, Any]]:
-
-    for account in accounts:
-
-        if (
-            str(
-                account.get(
-                    "account_type",
-                    ""
-                )
-            ).lower()
-            == account_type
-        ):
-            return account
-
-    return None
-
-
-def get_deriv_otp(
-    access_token: str,
-    account_id: str
+def account_currency(
+    session: Dict[str, Any],
+    account: str,
 ) -> str:
 
-    result = deriv_rest(
-        "POST",
-        f"/trading/v1/options/accounts/{account_id}/otp",
-        access_token,
-        body={},
+    return (
+        session.get("account_currencies", {})
+        .get(account)
+        or "USD"
     )
 
-    data = result.get(
-        "data",
-        result
-    )
 
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "Deriv OTP response was not an object."
-        )
+def sanitize_accounts(
+    session: Dict[str, Any],
+) -> Dict[str, bool]:
 
-    ws_url = (
-        data.get("url")
-        or data.get("websocket_url")
-        or data.get("ws_url")
-    )
+    accounts = session.get("accounts", {})
 
-    if not ws_url:
-        raise RuntimeError(
-            "Deriv OTP response did not contain a WebSocket URL."
-        )
-
-    return ws_url
+    return {
+        "demo": bool(accounts.get("demo")),
+        "real": bool(accounts.get("real")),
+    }
 
 
 # ============================================================
-# DERIV OAUTH 2.0 + PKCE
+# SESSION CREATION
 # ============================================================
 
-def make_pkce() -> tuple[str, str]:
+def create_session() -> Tuple[str, Dict[str, Any]]:
 
-    verifier = secrets.token_urlsafe(64)[:128]
+    session_id = create_session_id()
 
-    challenge_bytes = hashlib.sha256(
-        verifier.encode("ascii")
-    ).digest()
+    session = {
+        "session_id": session_id,
 
-    challenge = (
-        base64.urlsafe_b64encode(
-            challenge_bytes
-        )
+        "created_at": utc_now_iso(),
+        "last_activity": utc_now_iso(),
+
+        "connected": False,
+        "connection_status": "disconnected",
+
+        "access_token": None,
+        "refresh_token": None,
+        "token_expires_at": None,
+
+        "accounts": {
+            "demo": None,
+            "real": None,
+        },
+
+        "account_currencies": {
+            "demo": "USD",
+            "real": "USD",
+        },
+
+        "balances": {
+            "demo": None,
+            "real": None,
+        },
+
+        "demo_stats": {
+            "profit": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+        },
+
+        "real_stats": {
+            "profit": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+        },
+
+        "demo_history": [],
+        "real_history": [],
+
+        "account": "demo",
+
+        "stake": 2.0,
+        "duration": DEFAULT_DURATION,
+        "duration_unit": DEFAULT_DURATION_UNIT,
+
+        "real_market_mode": False,
+
+        "trading": False,
+
+        "session_profit": 0.0,
+        "session_trades": 0,
+        "session_wins": 0,
+        "session_losses": 0,
+
+        "consecutive_losses": 0,
+
+        "active_trade": None,
+
+        "trade_lock": asyncio.Lock(),
+
+        "last_prediction": None,
+    }
+
+    USER_SESSIONS[session_id] = session
+
+    return session_id, session
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "Fixed Risk Booster",
+        "version": APP_VERSION,
+        "deriv_options": True,
+        "real_trading_enabled": REAL_TRADING_ENABLED,
+        "time": utc_now_iso(),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "version": APP_VERSION,
+        "time": utc_now_iso(),
+    }
+
+
+# ============================================================
+# SESSION API
+# ============================================================
+
+@app.post("/api/session/register")
+async def register_session():
+
+    session_id, session = create_session()
+
+    return {
+        "status": "registered",
+        "session_id": session_id,
+        "connected": session["connected"],
+        "connection_status": session["connection_status"],
+        "balances": session["balances"],
+        "accounts": sanitize_accounts(session),
+        "message": (
+            "Application session registered. "
+            "Connect your own Deriv account to access "
+            "your Demo and Real Options accounts."
+        ),
+    }
+
+
+@app.get("/api/session/status/{session_id}")
+async def session_status(
+    session_id: str,
+):
+
+    session = require_session(session_id)
+
+    session["last_activity"] = utc_now_iso()
+
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "connected": session["connected"],
+        "connection_status": session["connection_status"],
+        "accounts": sanitize_accounts(session),
+        "balances": session["balances"],
+        "account": session["account"],
+        "stake": session["stake"],
+        "duration": session["duration"],
+        "duration_unit": session["duration_unit"],
+        "real_market_mode": session["real_market_mode"],
+        "trading": session["trading"],
+        "consecutive_losses": session["consecutive_losses"],
+        "active_trade": session["active_trade"],
+    }
+
+
+# ============================================================
+# PKCE
+# ============================================================
+
+def base64url_encode(
+    value: bytes,
+) -> str:
+
+    return (
+        base64.urlsafe_b64encode(value)
         .rstrip(b"=")
         .decode("ascii")
     )
 
+
+def make_pkce() -> Tuple[str, str]:
+
+    verifier = base64url_encode(
+        secrets.token_bytes(32)
+    )
+
+    digest = hashlib.sha256(
+        verifier.encode("ascii")
+    ).digest()
+
+    challenge = base64url_encode(digest)
+
     return verifier, challenge
 
 
-def require_oauth_config() -> None:
+def require_oauth_config():
 
     missing = []
 
@@ -550,50 +524,41 @@ def require_oauth_config() -> None:
     if not DERIV_REDIRECT_URI:
         missing.append("DERIV_REDIRECT_URI")
 
-    if missing:
+    if not FRONTEND_ORIGIN:
+        missing.append("FRONTEND_ORIGIN")
 
+    if missing:
         raise HTTPException(
-            status_code=503,
+            status_code=500,
             detail=(
-                "Deriv OAuth is not configured. "
-                f"Missing: {', '.join(missing)}"
+                "Missing backend environment variables: "
+                + ", ".join(missing)
             ),
         )
 
 
+# ============================================================
+# DERIV OAUTH LOGIN
+# ============================================================
+
 @app.get("/auth/deriv/login")
-async def deriv_login(user_id: str):
+async def deriv_login(
+    session_id: str,
+):
 
     require_oauth_config()
 
-    if not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing application session ID.",
-        )
-
-    session = require_session(user_id)
-
-    state = secrets.token_urlsafe(32)
+    session = require_session(session_id)
 
     verifier, challenge = make_pkce()
 
+    state = secrets.token_urlsafe(32)
+
     OAUTH_STATES[state] = {
-        "user_id": user_id,
+        "session_id": session_id,
         "code_verifier": verifier,
         "created_at": time.time(),
     }
-
-    # Remove stale OAuth states.
-    cutoff = time.time() - 600
-
-    for key in list(OAUTH_STATES):
-
-        if (
-            OAUTH_STATES[key]["created_at"]
-            < cutoff
-        ):
-            del OAUTH_STATES[key]
 
     params = {
         "response_type": "code",
@@ -605,249 +570,443 @@ async def deriv_login(user_id: str):
         "code_challenge_method": "S256",
     }
 
-    login_url = (
+    authorization_url = (
         f"{DERIV_AUTH_BASE}/oauth2/auth?"
-        f"{urlencode(params)}"
+        + urllib.parse.urlencode(params)
     )
 
     session["connection_status"] = "oauth_pending"
 
-    return RedirectResponse(
-        login_url,
-        status_code=302,
-    )
+    return {
+        "status": "ok",
+        "authorization_url": authorization_url,
+    }
 
 
-def exchange_oauth_code(
+# ============================================================
+# DERIV TOKEN EXCHANGE
+# ============================================================
+
+async def exchange_oauth_code(
     code: str,
-    verifier: str
+    code_verifier: str,
 ) -> Dict[str, Any]:
 
-    body = urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": DERIV_CLIENT_ID,
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": DERIV_REDIRECT_URI,
-        }
-    ).encode("utf-8")
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": DERIV_CLIENT_ID,
+        "code": code,
+        "code_verifier": code_verifier,
+        "redirect_uri": DERIV_REDIRECT_URI,
+    }
 
-    req = Request(
-        f"{DERIV_AUTH_BASE}/oauth2/token",
-        method="POST",
-        headers={
-            "Content-Type":
-                "application/x-www-form-urlencoded",
-            "User-Agent":
-                "FixedRiskBooster/5.0",
-        },
-        data=body,
-    )
+    async with httpx.AsyncClient(
+        timeout=20
+    ) as client:
 
-    try:
-
-        with urlopen(
-            req,
-            timeout=20
-        ) as response:
-
-            return json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except HTTPError as exc:
-
-        raw = exc.read().decode(
-            "utf-8",
-            errors="replace"
+        response = await client.post(
+            f"{DERIV_AUTH_BASE}/oauth2/token",
+            data=payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": (
+                    "application/x-www-form-urlencoded"
+                ),
+            },
         )
 
+    if response.status_code >= 400:
         raise RuntimeError(
-            f"Deriv OAuth token exchange failed "
-            f"({exc.code}): {raw}"
-        ) from exc
+            "Deriv OAuth token exchange failed: "
+            f"{response.text[:500]}"
+        )
 
+    return response.json()
+
+
+# ============================================================
+# DERIV REST
+# ============================================================
+
+async def deriv_rest_async(
+    method: str,
+    path: str,
+    access_token: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+
+    url = f"{DERIV_REST_BASE}{path}"
+
+    async with httpx.AsyncClient(
+        timeout=20
+    ) as client:
+
+        response = await client.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Deriv REST error {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# OPTIONS ACCOUNTS
+# ============================================================
+
+def extract_account_records(
+    response: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+
+    data = response.get("data")
+
+    if isinstance(data, list):
+        return [
+            item for item in data
+            if isinstance(item, dict)
+        ]
+
+    if isinstance(data, dict):
+
+        for key in (
+            "accounts",
+            "items",
+            "results",
+            "data",
+        ):
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return [
+                    item for item in value
+                    if isinstance(item, dict)
+                ]
+
+        return [data]
+
+    return []
+
+
+def normalize_account_type(
+    account: Dict[str, Any],
+) -> str:
+
+    value = str(
+        account.get("account_type")
+        or account.get("type")
+        or account.get("environment")
+        or ""
+    ).lower()
+
+    if "real" in value:
+        return "real"
+
+    if "demo" in value:
+        return "demo"
+
+    account_id = str(
+        account.get("account_id")
+        or account.get("id")
+        or ""
+    ).upper()
+
+    if account_id.startswith("VRTC"):
+        return "demo"
+
+    return ""
+
+
+def extract_account_id(
+    account: Dict[str, Any],
+) -> Optional[str]:
+
+    value = (
+        account.get("account_id")
+        or account.get("accountId")
+        or account.get("id")
+        or account.get("loginid")
+    )
+
+    if value is None:
+        return None
+
+    return str(value)
+
+
+async def get_deriv_accounts(
+    access_token: str,
+) -> List[Dict[str, Any]]:
+
+    response = await deriv_rest_async(
+        "GET",
+        "/trading/v1/options/accounts",
+        access_token,
+    )
+
+    return extract_account_records(response)
+
+
+async def load_options_accounts(
+    session: Dict[str, Any],
+):
+
+    token = session.get("access_token")
+
+    if not token:
+        raise RuntimeError(
+            "No Deriv access token is available."
+        )
+
+    accounts = await get_deriv_accounts(token)
+
+    demo_id = None
+    real_id = None
+
+    demo_currency = "USD"
+    real_currency = "USD"
+
+    for account in accounts:
+
+        account_type = normalize_account_type(account)
+
+        account_id = extract_account_id(account)
+
+        if not account_id:
+            continue
+
+        currency = (
+            account.get("currency")
+            or account.get("currency_code")
+            or "USD"
+        )
+
+        if account_type == "demo" and not demo_id:
+            demo_id = account_id
+            demo_currency = str(currency)
+
+        elif account_type == "real" and not real_id:
+            real_id = account_id
+            real_currency = str(currency)
+
+    session["accounts"]["demo"] = demo_id
+    session["accounts"]["real"] = real_id
+
+    session["account_currencies"]["demo"] = demo_currency
+    session["account_currencies"]["real"] = real_currency
+
+    return {
+        "demo": demo_id,
+        "real": real_id,
+    }
+
+
+# ============================================================
+# OAUTH CALLBACK
+# ============================================================
 
 @app.get("/auth/deriv/callback")
 async def deriv_callback(
-    code: Optional[str] = None,
-    state: Optional[str] = None,
-    error: Optional[str] = None,
+    code: Optional[str] = Query(default=None),
+    state: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
 ):
 
     if error:
-
-        return HTMLResponse(
-            "<h2>Deriv connection cancelled</h2>"
-            f"<p>{error}</p>"
-            "<p>You can close this tab.</p>",
-            status_code=400,
+        frontend = (
+            f"{FRONTEND_ORIGIN}"
+            f"?deriv=error"
+            f"&message="
+            f"{urllib.parse.quote(error)}"
         )
+
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse(frontend)
 
     if not code or not state:
-
-        return HTMLResponse(
-            "<h2>Missing Deriv OAuth response.</h2>"
-            "<p>You can close this tab.</p>",
+        raise HTTPException(
             status_code=400,
+            detail="Missing OAuth code or state.",
         )
 
-    oauth = OAUTH_STATES.pop(
-        state,
-        None
-    )
+    oauth = OAUTH_STATES.pop(state, None)
 
     if not oauth:
-
-        return HTMLResponse(
-            "<h2>Invalid or expired OAuth state.</h2>"
-            "<p>Please connect Deriv again.</p>",
+        raise HTTPException(
             status_code=400,
+            detail="Invalid or expired OAuth state.",
         )
 
-    if (
-        time.time()
-        - oauth["created_at"]
-        > 600
-    ):
-
-        return HTMLResponse(
-            "<h2>OAuth state expired.</h2>"
-            "<p>Please connect Deriv again.</p>",
+    if time.time() - oauth["created_at"] > 600:
+        raise HTTPException(
             status_code=400,
+            detail="OAuth state expired.",
         )
 
-    user_id = oauth["user_id"]
+    session_id = oauth["session_id"]
+
+    session = require_session(session_id)
 
     try:
 
-        session = require_session(user_id)
-
-        token_result = exchange_oauth_code(
-            code,
-            oauth["code_verifier"]
+        token_data = await exchange_oauth_code(
+            code=code,
+            code_verifier=oauth["code_verifier"],
         )
 
-        access_token = token_result.get(
-            "access_token"
-        )
+        access_token = token_data.get("access_token")
 
         if not access_token:
-
             raise RuntimeError(
                 "Deriv did not return an access token."
             )
 
-        # Keep credentials server-side only.
-        session["oauth_access_token"] = (
-            access_token
+        session["access_token"] = access_token
+
+        session["refresh_token"] = (
+            token_data.get("refresh_token")
         )
 
-        session["oauth_refresh_token"] = (
-            token_result.get("refresh_token")
+        expires_in = safe_int(
+            token_data.get("expires_in"),
+            3600,
         )
 
-        expires_in = safe_float(
-            token_result.get("expires_in")
+        session["token_expires_at"] = (
+            time.time() + (expires_in or 3600)
         )
 
-        if expires_in:
-            session["oauth_expires_at"] = (
-                time.time() + expires_in
-            )
-        else:
-            session["oauth_expires_at"] = None
+        await load_options_accounts(session)
 
         session["connected"] = True
+        session["connection_status"] = "connected"
+        session["last_activity"] = utc_now_iso()
 
-        session["connection_status"] = (
-            "authorised"
-        )
+        await refresh_all_balances(session)
 
-        accounts = get_deriv_accounts(
-            access_token
-        )
-
-        demo = get_account_from_list(
-            accounts,
-            "demo"
-        )
-
-        real = get_account_from_list(
-            accounts,
-            "real"
-        )
-
-        session["accounts"]["demo"] = demo
-        session["accounts"]["real"] = real
-
-        session["balances"]["demo"] = (
-            safe_float(
-                demo.get("balance")
-            )
-            if demo
-            else None
-        )
-
-        session["balances"]["real"] = (
-            safe_float(
-                real.get("balance")
-            )
-            if real
-            else None
-        )
-
-        # Never automatically switch to Real.
-        session["account"] = "demo"
-
-        if (
-            FRONTEND_ORIGIN
-            and FRONTEND_ORIGIN != "*"
-        ):
-
-            separator = (
-                "&"
-                if "?" in FRONTEND_ORIGIN
-                else "?"
-            )
-
-            return RedirectResponse(
-                (
-                    f"{FRONTEND_ORIGIN}"
-                    f"{separator}"
-                    f"deriv=connected"
-                    f"&user_id={user_id}"
-                ),
-                status_code=302,
-            )
-
-        return HTMLResponse(
-            "<h2>Deriv connected successfully.</h2>"
-            "<p>Your Deriv Options accounts are linked.</p>"
-            "<p>You can close this tab.</p>",
-            status_code=200,
+        frontend_url = (
+            f"{FRONTEND_ORIGIN}"
+            f"?deriv=connected"
+            f"&session_id="
+            f"{urllib.parse.quote(session_id)}"
         )
 
     except Exception as exc:
 
-        return HTMLResponse(
-            "<h2>Deriv connection failed</h2>"
-            f"<p>{str(exc)[:500]}</p>"
-            "<p>You can close this tab.</p>",
-            status_code=500,
+        session["connected"] = False
+        session["connection_status"] = "error"
+
+        frontend_url = (
+            f"{FRONTEND_ORIGIN}"
+            f"?deriv=error"
+            f"&message="
+            f"{urllib.parse.quote(str(exc)[:300])}"
         )
+
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(frontend_url)
+
+
+# ============================================================
+# OTP
+# ============================================================
+
+async def get_deriv_otp(
+    access_token: str,
+    account_id: str,
+) -> str:
+
+    response = await deriv_rest_async(
+        "POST",
+        f"/trading/v1/options/accounts/"
+        f"{urllib.parse.quote(account_id, safe='')}/otp",
+        access_token,
+    )
+
+    data = response.get("data", {})
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Invalid OTP response from Deriv."
+        )
+
+    ws_url = (
+        data.get("url")
+        or data.get("ws_url")
+        or data.get("websocket_url")
+    )
+
+    if not ws_url:
+        raise RuntimeError(
+            "Deriv OTP response did not contain a WebSocket URL."
+        )
+
+    return str(ws_url)
 
 
 # ============================================================
 # DERIV WEBSOCKET HELPERS
 # ============================================================
 
+def payload_msg_type(
+    payload: Dict[str, Any],
+) -> str:
+
+    if "ticks_history" in payload:
+        return "history"
+
+    if "ticks" in payload:
+        return "tick"
+
+    if "proposal" in payload:
+        return "proposal"
+
+    if "buy" in payload:
+        return "buy"
+
+    if "proposal_open_contract" in payload:
+        return "proposal_open_contract"
+
+    if "balance" in payload:
+        return "balance"
+
+    if "active_symbols" in payload:
+        return "active_symbols"
+
+    if "contracts_for" in payload:
+        return "contracts_for"
+
+    return ""
+
+
 async def ws_request(
     ws_url: str,
     payload: Dict[str, Any],
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
+
+    req_id = payload.get(
+        "req_id",
+        random_req_id(),
+    )
+
+    payload = dict(payload)
+    payload["req_id"] = req_id
+
+    expected_type = payload_msg_type(payload)
 
     async with websockets.connect(
         ws_url,
@@ -863,23 +1022,14 @@ async def ws_request(
         )
 
         deadline = (
-            time.monotonic()
-            + timeout
+            time.monotonic() + timeout
         )
 
-        expected_type = (
-            payload_msg_type(payload)
-        )
-
-        while (
-            time.monotonic()
-            < deadline
-        ):
+        while time.monotonic() < deadline:
 
             remaining = max(
                 0.5,
-                deadline
-                - time.monotonic()
+                deadline - time.monotonic(),
             )
 
             raw = await asyncio.wait_for(
@@ -890,59 +1040,32 @@ async def ws_request(
             data = json.loads(raw)
 
             if data.get("error"):
+                error = data["error"]
 
                 raise RuntimeError(
-                    data["error"].get(
+                    error.get(
                         "message",
-                        "Deriv WebSocket error."
+                        "Deriv WebSocket error.",
                     )
                 )
 
             if (
-                data.get("msg_type")
+                expected_type
+                and data.get("msg_type")
                 == expected_type
+            ):
+                return data
+
+            if (
+                data.get("req_id")
+                == req_id
+                and not expected_type
             ):
                 return data
 
         raise TimeoutError(
             "Timed out waiting for Deriv WebSocket response."
         )
-
-
-async def public_ws_request(
-    payload: Dict[str, Any],
-    timeout: float = 15.0,
-) -> Dict[str, Any]:
-
-    return await ws_request(
-        DERIV_PUBLIC_WS,
-        payload,
-        timeout,
-    )
-
-
-def payload_msg_type(
-    payload: Dict[str, Any]
-) -> str:
-
-    mapping = {
-        "balance": "balance",
-        "proposal": "proposal",
-        "buy": "buy",
-        "proposal_open_contract":
-            "proposal_open_contract",
-        "portfolio": "portfolio",
-        "active_symbols": "active_symbols",
-        "ticks_history": "history",
-        "ticks": "tick",
-    }
-
-    for key, value in mapping.items():
-
-        if key in payload:
-            return value
-
-    return ""
 
 
 async def authenticated_ws_request(
@@ -952,436 +1075,377 @@ async def authenticated_ws_request(
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
 
-    ws_url = await asyncio.to_thread(
-        get_deriv_otp,
+    # The OTP URL already authenticates the WebSocket.
+    # DO NOT send another authorize request.
+
+    ws_url = await get_deriv_otp(
         access_token,
         account_id,
     )
 
-    async with websockets.connect(
+    return await ws_request(
         ws_url,
-        open_timeout=10,
-        close_timeout=5,
-        ping_interval=20,
-        ping_timeout=10,
-        max_size=8 * 1024 * 1024,
-    ) as ws:
+        payload,
+        timeout=timeout,
+    )
 
-        await ws.send(
-            json.dumps(
-                {
-                    "authorize": access_token,
-                    "req_id": 1,
-                }
-            )
+
+# ============================================================
+# BALANCE
+# ============================================================
+
+async def get_account_balance(
+    access_token: str,
+    account_id: str,
+) -> Optional[float]:
+
+    response = await authenticated_ws_request(
+        access_token=access_token,
+        account_id=account_id,
+        payload={
+            "balance": 1,
+        },
+        timeout=15,
+    )
+
+    balance_data = response.get(
+        "balance",
+        {},
+    )
+
+    if not isinstance(balance_data, dict):
+        return None
+
+    return safe_float(
+        balance_data.get("balance")
+    )
+
+
+async def refresh_account_balance(
+    session: Dict[str, Any],
+    account: str,
+) -> Optional[float]:
+
+    token = session.get("access_token")
+
+    account_id = account_id_for(
+        session,
+        account,
+    )
+
+    if not token or not account_id:
+        return None
+
+    try:
+
+        balance = await get_account_balance(
+            token,
+            account_id,
         )
 
-        deadline = (
-            time.monotonic()
-            + timeout
-        )
+        session["balances"][account] = balance
 
-        while (
-            time.monotonic()
-            < deadline
-        ):
+        return balance
 
-            remaining = max(
-                0.5,
-                deadline
-                - time.monotonic()
-            )
+    except Exception:
+        return session["balances"].get(account)
 
-            raw = await asyncio.wait_for(
-                ws.recv(),
-                timeout=remaining,
-            )
 
-            auth_data = json.loads(raw)
+async def refresh_all_balances(
+    session: Dict[str, Any],
+):
 
-            if auth_data.get("error"):
+    await refresh_account_balance(
+        session,
+        "demo",
+    )
 
-                raise RuntimeError(
-                    auth_data["error"].get(
-                        "message",
-                        "Deriv authorization failed."
-                    )
-                )
-
-            if (
-                auth_data.get("msg_type")
-                == "authorize"
-            ):
-                break
-
-        else:
-
-            raise TimeoutError(
-                "Timed out authorizing Deriv WebSocket."
-            )
-
-        await ws.send(
-            json.dumps(payload)
-        )
-
-        expected_type = (
-            payload_msg_type(payload)
-        )
-
-        deadline = (
-            time.monotonic()
-            + timeout
-        )
-
-        while (
-            time.monotonic()
-            < deadline
-        ):
-
-            remaining = max(
-                0.5,
-                deadline
-                - time.monotonic()
-            )
-
-            raw = await asyncio.wait_for(
-                ws.recv(),
-                timeout=remaining,
-            )
-
-            data = json.loads(raw)
-
-            if data.get("error"):
-
-                raise RuntimeError(
-                    data["error"].get(
-                        "message",
-                        "Deriv WebSocket error."
-                    )
-                )
-
-            if (
-                data.get("msg_type")
-                == expected_type
-            ):
-                return data
-
-        raise TimeoutError(
-            "Timed out waiting for Deriv WebSocket response."
+    if session["accounts"].get("real"):
+        await refresh_account_balance(
+            session,
+            "real",
         )
 
 
 # ============================================================
-# MARKET DATA
+# PUBLIC MARKET DATA
 # ============================================================
+
+async def public_ws_request(
+    payload: Dict[str, Any],
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+
+    return await ws_request(
+        DERIV_PUBLIC_WS,
+        payload,
+        timeout=timeout,
+    )
+
 
 async def get_active_symbols() -> List[Dict[str, Any]]:
 
-    data = await public_ws_request(
+    response = await public_ws_request(
         {
             "active_symbols": "brief",
-            "contract_type": [
-                "CALL",
-                "PUT"
-            ],
-            "req_id": 1001,
-        }
+        },
+        timeout=20,
     )
 
-    symbols = data.get(
+    data = response.get(
         "active_symbols",
-        []
+        [],
     )
 
-    return (
-        symbols
-        if isinstance(symbols, list)
-        else []
-    )
+    if not isinstance(data, list):
+        return []
 
-
-def symbol_name(
-    item: Dict[str, Any]
-) -> str:
-
-    return (
-        item.get(
-            "underlying_symbol_name"
-        )
-        or item.get(
-            "display_name"
-        )
-        or item.get(
-            "underlying_symbol"
-        )
-        or item.get(
-            "symbol"
-        )
-        or ""
-    )
-
-
-def symbol_code(
-    item: Dict[str, Any]
-) -> str:
-
-    return (
-        item.get(
-            "underlying_symbol"
-        )
-        or item.get(
-            "symbol"
-        )
-        or ""
-    )
-
-
-def select_candidate_symbols(
-    symbols: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-
-    candidates = []
-
-    for item in symbols:
-
-        code = symbol_code(item)
-
-        market = str(
-            item.get(
-                "market",
-                ""
-            )
-        ).lower()
-
-        name = symbol_name(item)
-
-        if not code:
-            continue
-
-        if market not in {
-            "forex",
-            "synthetic_index",
-            "synthetic",
-        }:
-            continue
-
-        if int(
-            item.get(
-                "is_trading_suspended",
-                0
-            )
-            or 0
-        ) == 1:
-            continue
-
-        if (
-            int(
-                item.get(
-                    "exchange_is_open",
-                    1
-                )
-                or 1
-            )
-            == 0
-            and market == "forex"
-        ):
-            continue
-
-        candidates.append(
-            {
-                "asset": code,
-                "symbol": name or code,
-                "market": market,
-                "pip_size": item.get(
-                    "pip_size"
-                ),
-            }
-        )
-
-    candidates.sort(
-        key=lambda x: (
-            0
-            if x["market"] == "forex"
-            else 1,
-            x["symbol"],
-        )
-    )
-
-    return candidates[
-        :MAX_SYMBOLS_TO_ANALYZE
+    return [
+        item for item in data
+        if isinstance(item, dict)
     ]
+
+
+def symbol_is_trade_candidate(
+    symbol: Dict[str, Any],
+) -> bool:
+
+    code = clean_symbol(
+        symbol.get("symbol")
+    )
+
+    if not code:
+        return False
+
+    # Prefer synthetic/derived markets because the
+    # Fixed Risk Booster is intended for Options digit contracts.
+    market = str(
+        symbol.get("market")
+        or symbol.get("market_display_name")
+        or ""
+    ).lower()
+
+    symbol_type = str(
+        symbol.get("symbol_type")
+        or ""
+    ).lower()
+
+    exchange_open = symbol.get(
+        "exchange_is_open",
+        True,
+    )
+
+    if exchange_open is False:
+        return False
+
+    if (
+        "synthetic" in market
+        or "derived" in market
+        or "synthetic" in symbol_type
+        or "derived" in symbol_type
+    ):
+        return True
+
+    # Some Deriv responses may not expose the market
+    # classification consistently. Keep valid-looking
+    # symbols as fallback candidates.
+    return True
 
 
 async def get_tick_history(
     symbol: str,
     count: int = HISTORY_TICKS,
-) -> List[Dict[str, Any]]:
+) -> List[float]:
 
-    data = await public_ws_request(
+    count = int(
+        clamp(
+            count,
+            50,
+            10000,
+        )
+    )
+
+    response = await public_ws_request(
         {
             "ticks_history": symbol,
-            "count": max(
-                100,
-                min(
-                    count,
-                    10000
-                )
-            ),
+            "count": count,
             "end": "latest",
             "style": "ticks",
-            "req_id": 2001,
         },
-        timeout=20,
+        timeout=25,
     )
 
-    history = data.get(
+    history = response.get(
         "history",
-        {}
+        {},
     )
 
-    prices = history.get(
-        "prices",
-        []
-    )
+    if not isinstance(history, dict):
+        return []
 
-    times = history.get(
-        "times",
-        []
-    )
+    prices = history.get("prices", [])
 
-    result = []
+    if not isinstance(prices, list):
+        return []
 
-    for price, epoch in zip(
-        prices,
-        times
-    ):
+    values = []
 
-        try:
+    for price in prices:
 
-            result.append(
-                {
-                    "price": float(price),
-                    "epoch": int(epoch),
-                }
-            )
+        number = safe_float(price)
 
-        except (
-            TypeError,
-            ValueError
-        ):
-            continue
+        if number is not None:
+            values.append(number)
 
-    if len(result) < 100:
-
-        raise RuntimeError(
-            f"Insufficient tick history for {symbol}."
-        )
-
-    return result
+    return values
 
 
 async def get_latest_tick(
-    symbol: str
-) -> Dict[str, Any]:
+    symbol: str,
+) -> Optional[float]:
 
-    data = await public_ws_request(
+    response = await public_ws_request(
         {
             "ticks": symbol,
-            "subscribe": 0,
-            "req_id": 2002,
         },
         timeout=10,
     )
 
-    tick = data.get(
+    tick = response.get(
         "tick",
-        {}
+        {},
     )
 
-    if not tick:
-        raise RuntimeError(
-            f"No current tick returned for {symbol}."
-        )
+    if not isinstance(tick, dict):
+        return None
 
-    return {
-        "price": float(
-            tick["quote"]
-        ),
-        "epoch": int(
-            tick["epoch"]
-        ),
-    }
+    return safe_float(
+        tick.get("quote")
+    )
 
 
 # ============================================================
-# PREDICTION FEATURES
+# DIGIT EXTRACTION
+# ============================================================
+
+def decimal_places(
+    value: float,
+) -> int:
+
+    text = f"{value:.10f}".rstrip("0")
+
+    if "." not in text:
+        return 0
+
+    return len(
+        text.split(".")[1]
+    )
+
+
+def last_digit(
+    quote: float,
+    pip: Optional[float] = None,
+) -> int:
+
+    if pip is not None and pip > 0:
+
+        places = max(
+            0,
+            int(round(-math.log10(pip))),
+        )
+
+    else:
+        places = decimal_places(quote)
+
+    if places <= 0:
+        scaled = int(round(quote))
+    else:
+        scaled = int(
+            round(
+                quote * (10 ** places)
+            )
+        )
+
+    return abs(scaled) % 10
+
+
+def extract_digits(
+    prices: List[float],
+    pip: Optional[float] = None,
+) -> List[int]:
+
+    return [
+        last_digit(
+            price,
+            pip,
+        )
+        for price in prices
+    ]
+
+
+# ============================================================
+# TECHNICAL HELPERS
 # ============================================================
 
 def ema(
     values: List[float],
-    period: int
-) -> float:
+    period: int,
+) -> List[float]:
 
     if not values:
-        return 0.0
+        return []
 
     period = max(
         2,
-        min(
-            period,
-            len(values)
-        )
+        min(period, len(values)),
     )
 
-    k = 2.0 / (
-        period + 1.0
+    multiplier = 2 / (
+        period + 1
     )
 
-    result = values[0]
+    result = [
+        values[0]
+    ]
 
     for value in values[1:]:
 
-        result = (
-            value * k
-            + result * (1.0 - k)
+        result.append(
+            (
+                value
+                - result[-1]
+            )
+            * multiplier
+            + result[-1]
         )
 
     return result
 
 
-def rsi(
+def calculate_rsi(
     values: List[float],
-    period: int = 14
-) -> float:
+    period: int = 14,
+) -> Optional[float]:
 
     if len(values) <= period:
-        return 50.0
+        return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
+    for i in range(1, len(values)):
 
-        change = (
+        diff = (
             values[i]
             - values[i - 1]
         )
 
         gains.append(
-            max(
-                change,
-                0.0
-            )
+            max(diff, 0)
         )
 
         losses.append(
-            max(
-                -change,
-                0.0
-            )
+            max(-diff, 0)
         )
 
     avg_gain = (
@@ -1396,7 +1460,7 @@ def rsi(
 
     for i in range(
         period,
-        len(gains)
+        len(gains),
     ):
 
         avg_gain = (
@@ -1416,986 +1480,776 @@ def rsi(
         ) / period
 
     if avg_loss == 0:
-
-        return (
-            100.0
-            if avg_gain > 0
-            else 50.0
-        )
+        return 100.0
 
     rs = (
         avg_gain
         / avg_loss
     )
 
-    return (
-        100.0
-        - (
-            100.0
-            / (1.0 + rs)
-        )
+    return 100 - (
+        100 / (1 + rs)
     )
 
 
-def feature_snapshot(
-    prices: List[float]
-) -> Dict[str, float]:
+def calculate_volatility(
+    values: List[float],
+) -> Optional[float]:
 
-    medium = prices[-50:]
-
-    if len(prices) < 50:
-        medium = prices
-
-    e9 = ema(
-        medium,
-        9
-    )
-
-    e21 = ema(
-        medium,
-        21
-    )
-
-    current = prices[-1]
-
-    lookback = min(
-        10,
-        len(prices) - 1
-    )
-
-    momentum_pct = (
-        (
-            current
-            - prices[
-                -1 - lookback
-            ]
-        )
-        / prices[
-            -1 - lookback
-        ]
-    ) * 100.0
-
-    micro_window = min(
-        8,
-        len(prices)
-    )
-
-    micro = prices[
-        -micro_window:
-    ]
-
-    micro_slope = 0.0
-
-    if len(micro) >= 2:
-
-        micro_slope = (
-            (
-                micro[-1]
-                - micro[0]
-            )
-            / micro[0]
-        ) * 100.0
-
-    rsi_value = rsi(
-        prices,
-        14
-    )
+    if len(values) < 2:
+        return None
 
     returns = []
 
-    for i in range(
-        max(
-            1,
-            len(prices) - 30
-        ),
-        len(prices)
+    for previous, current in zip(
+        values[:-1],
+        values[1:],
     ):
 
-        if prices[i - 1] != 0:
+        if previous == 0:
+            continue
 
-            returns.append(
-                (
-                    (
-                        prices[i]
-                        - prices[i - 1]
-                    )
-                    / prices[i - 1]
-                )
-                * 100.0
+        returns.append(
+            (
+                current - previous
             )
-
-    volatility = (
-        math.sqrt(
-            sum(
-                x * x
-                for x in returns
-            )
-            / len(returns)
+            / previous
         )
-        if returns
-        else 0.0
+
+    if len(returns) < 2:
+        return None
+
+    return statistics.pstdev(
+        returns
+    )
+
+
+# ============================================================
+# DIGIT STRATEGY
+# ============================================================
+
+def classify_digit(
+    digit: int,
+    barrier: int,
+) -> Optional[str]:
+
+    if digit > barrier:
+        return "OVER"
+
+    if digit < barrier:
+        return "UNDER"
+
+    return None
+
+
+def prediction_from_digits(
+    digits: List[int],
+    barrier: int,
+) -> Dict[str, Any]:
+
+    if not digits:
+        return {
+            "direction": "NO TRADE",
+            "confidence": 0,
+            "accuracy": 0,
+            "samples": 0,
+            "barrier": barrier,
+            "reason": "No digit data available.",
+        }
+
+    over_count = sum(
+        1
+        for digit in digits
+        if digit > barrier
+    )
+
+    under_count = sum(
+        1
+        for digit in digits
+        if digit < barrier
+    )
+
+    total = len(digits)
+
+    over_rate = (
+        over_count / total
+    ) * 100
+
+    under_rate = (
+        under_count / total
+    ) * 100
+
+    if over_rate > under_rate:
+
+        direction = "OVER"
+        probability = over_rate
+
+    elif under_rate > over_rate:
+
+        direction = "UNDER"
+        probability = under_rate
+
+    else:
+
+        direction = "NO TRADE"
+        probability = 50.0
+
+    edge = abs(
+        over_rate - under_rate
+    )
+
+    confidence = clamp(
+        50 + edge * 2,
+        0,
+        99,
     )
 
     return {
-        "price": current,
-        "ema9": e9,
-        "ema21": e21,
-        "ema_gap_pct": (
-            (
-                (e9 - e21)
-                / current
-            )
-            * 100.0
-            if current
-            else 0.0
+        "direction": direction,
+        "confidence": round(
+            confidence,
+            2,
         ),
-        "momentum_pct": momentum_pct,
-        "micro_slope_pct":
-            micro_slope,
-        "rsi": rsi_value,
-        "volatility_pct":
-            volatility,
+        "accuracy": round(
+            probability,
+            2,
+        ),
+        "samples": total,
+        "barrier": barrier,
+        "over_rate": round(
+            over_rate,
+            2,
+        ),
+        "under_rate": round(
+            under_rate,
+            2,
+        ),
+        "reason": (
+            "Historical digit distribution "
+            "used for this live analysis."
+        ),
     }
 
 
-def rule_direction(
-    features: Dict[str, float]
-) -> str:
-
-    bullish = 0.0
-    bearish = 0.0
-
-    if (
-        features["ema9"]
-        > features["ema21"]
-    ):
-        bullish += 2.0
-
-    elif (
-        features["ema9"]
-        < features["ema21"]
-    ):
-        bearish += 2.0
-
-    if (
-        features["momentum_pct"]
-        > 0
-    ):
-        bullish += 2.0
-
-    elif (
-        features["momentum_pct"]
-        < 0
-    ):
-        bearish += 2.0
-
-    if (
-        features["micro_slope_pct"]
-        > 0
-    ):
-        bullish += 1.0
-
-    elif (
-        features["micro_slope_pct"]
-        < 0
-    ):
-        bearish += 1.0
-
-    if (
-        52
-        <= features["rsi"]
-        <= 68
-    ):
-        bullish += 1.0
-
-    elif (
-        32
-        <= features["rsi"]
-        <= 48
-    ):
-        bearish += 1.0
-
-    if bullish >= bearish + 2.0:
-        return "CALL"
-
-    if bearish >= bullish + 2.0:
-        return "PUT"
-
-    return "NO_TRADE"
-
-
-# ============================================================
-# BACKTEST
-# ============================================================
-
-def backtest_prediction(
-    history: List[Dict[str, Any]],
-    horizon: int = PREDICTION_HORIZON_TICKS,
+def walk_forward_backtest(
+    digits: List[int],
+    barrier: int,
+    min_samples: int = MIN_BACKTEST_SAMPLES,
 ) -> Dict[str, Any]:
 
-    prices = [
-        x["price"]
-        for x in history
-    ]
-
-    minimum = (
-        70 + horizon
-    )
-
-    if len(prices) < minimum:
-
+    if len(digits) < min_samples + 10:
         return {
             "samples": 0,
             "wins": 0,
             "losses": 0,
-            "accuracy_pct": 0.0,
-            "skipped": 0,
-            "evaluated": False,
+            "accuracy": 0.0,
+            "valid": False,
         }
-
-    split = int(
-        len(prices) * 0.70
-    )
-
-    start = max(
-        50,
-        split
-    )
 
     wins = 0
     losses = 0
-    skipped = 0
+    samples = 0
 
-    for i in range(
+    start = max(
+        20,
+        min_samples,
+    )
+
+    for index in range(
         start,
-        len(prices) - horizon
+        len(digits) - 1,
     ):
 
-        window = prices[
-            :i + 1
-        ]
+        training = digits[:index]
 
-        features = feature_snapshot(
-            window
+        over = sum(
+            1
+            for digit in training
+            if digit > barrier
         )
 
-        direction = rule_direction(
-            features
+        under = sum(
+            1
+            for digit in training
+            if digit < barrier
         )
 
-        if direction == "NO_TRADE":
-
-            skipped += 1
+        if over == under:
             continue
 
-        future = prices[
-            i + horizon
-        ]
+        prediction = (
+            "OVER"
+            if over > under
+            else "UNDER"
+        )
 
-        current = prices[i]
+        actual = classify_digit(
+            digits[index],
+            barrier,
+        )
 
-        if direction == "CALL":
-            correct = (
-                future > current
-            )
-        else:
-            correct = (
-                future < current
-            )
+        if actual is None:
+            continue
 
-        if correct:
+        samples += 1
+
+        if prediction == actual:
             wins += 1
         else:
             losses += 1
 
-    total = (
-        wins + losses
-    )
-
     accuracy = (
-        wins / total * 100.0
-        if total
+        wins / samples * 100
+        if samples
         else 0.0
     )
 
     return {
-        "samples": total,
+        "samples": samples,
         "wins": wins,
         "losses": losses,
-        "accuracy_pct":
-            round(
-                accuracy,
-                2
-            ),
-        "skipped": skipped,
-        "evaluated":
-            total
-            >= MIN_BACKTEST_SAMPLES,
+        "accuracy": round(
+            accuracy,
+            2,
+        ),
+        "valid": (
+            samples >= 1
+        ),
     }
 
 
-def calculate_confidence(
-    backtest: Dict[str, Any],
-    features: Dict[str, float],
-    direction: str,
-) -> float:
-
-    if direction == "NO_TRADE":
-        return 0.0
-
-    base = 50.0
-
-    if (
-        backtest["samples"]
-        >= MIN_BACKTEST_SAMPLES
-    ):
-
-        base += max(
-            -10.0,
-            min(
-                25.0,
-                backtest[
-                    "accuracy_pct"
-                ] - 50.0
-            )
-        )
-
-    agreement = 0
-
-    if direction == "CALL":
-
-        agreement += (
-            features["ema9"]
-            > features["ema21"]
-        )
-
-        agreement += (
-            features["momentum_pct"]
-            > 0
-        )
-
-        agreement += (
-            features[
-                "micro_slope_pct"
-            ]
-            > 0
-        )
-
-        agreement += (
-            52
-            <= features["rsi"]
-            <= 68
-        )
-
-    else:
-
-        agreement += (
-            features["ema9"]
-            < features["ema21"]
-        )
-
-        agreement += (
-            features["momentum_pct"]
-            < 0
-        )
-
-        agreement += (
-            features[
-                "micro_slope_pct"
-            ]
-            < 0
-        )
-
-        agreement += (
-            32
-            <= features["rsi"]
-            <= 48
-        )
-
-    base += (
-        agreement * 4.0
-    )
-
-    if (
-        features["volatility_pct"]
-        < 0.00001
-    ):
-        base -= 10.0
-
-    return round(
-        max(
-            0.0,
-            min(
-                95.0,
-                base
-            )
-        ),
-        1,
-    )
-
-
 # ============================================================
-# LIVE PREDICTION ENGINE
+# MARKET ANALYSIS
 # ============================================================
 
 async def analyze_symbol(
-    candidate: Dict[str, Any]
-) -> Dict[str, Any]:
+    symbol_data: Dict[str, Any],
+    barrier: int = DEFAULT_BARRIER,
+) -> Optional[Dict[str, Any]]:
 
-    symbol = candidate["asset"]
-
-    # IMPORTANT:
-    # Fresh history is collected on every uncached analysis.
-    history = await get_tick_history(
-        symbol,
-        HISTORY_TICKS
+    symbol = clean_symbol(
+        symbol_data.get("symbol")
     )
 
-    prices = [
-        x["price"]
-        for x in history
-    ]
+    if not symbol:
+        return None
 
-    features = feature_snapshot(
-        prices
-    )
+    try:
 
-    direction = rule_direction(
-        features
-    )
-
-    backtest = backtest_prediction(
-        history,
-        PREDICTION_HORIZON_TICKS
-    )
-
-    confidence = calculate_confidence(
-        backtest,
-        features,
-        direction
-    )
-
-    # Get the newest tick AFTER the history
-    # was collected.
-    latest = await get_latest_tick(
-        symbol
-    )
-
-    price_change = (
-        (
-            latest["price"]
-            - features["price"]
+        prices = await get_tick_history(
+            symbol,
+            HISTORY_TICKS,
         )
-        / features["price"]
-        * 100.0
-        if features["price"]
-        else 0.0
-    )
 
-    tradeable = (
-        direction != "NO_TRADE"
-        and backtest["evaluated"]
-        and (
-            backtest[
-                "accuracy_pct"
-            ]
-            >= MIN_EDGE_ACCURACY
+        if len(prices) < 50:
+            return None
+
+        pip = safe_float(
+            symbol_data.get("pip")
         )
-        and (
-            confidence
+
+        digits = extract_digits(
+            prices,
+            pip,
+        )
+
+        prediction = prediction_from_digits(
+            digits,
+            barrier,
+        )
+
+        backtest = walk_forward_backtest(
+            digits,
+            barrier,
+            MIN_BACKTEST_SAMPLES,
+        )
+
+        rsi = calculate_rsi(
+            prices
+        )
+
+        ema_fast = ema(
+            prices,
+            9,
+        )
+
+        ema_slow = ema(
+            prices,
+            21,
+        )
+
+        trend = "NEUTRAL"
+
+        if (
+            ema_fast
+            and ema_slow
+        ):
+
+            if ema_fast[-1] > ema_slow[-1]:
+                trend = "UP"
+
+            elif ema_fast[-1] < ema_slow[-1]:
+                trend = "DOWN"
+
+        volatility = calculate_volatility(
+            prices
+        )
+
+        latest = prices[-1]
+
+        tradeable = (
+            prediction["direction"]
+            != "NO TRADE"
+            and prediction["confidence"]
             >= MIN_CONFIDENCE_TO_TRADE
+            and (
+                backtest["accuracy"]
+                >= MIN_EDGE_ACCURACY
+                if backtest["samples"] > 0
+                else False
+            )
         )
+
+        if not backtest["valid"]:
+            tradeable = False
+
+        return {
+            "asset": symbol,
+            "display_name": (
+                symbol_data.get(
+                    "display_name"
+                )
+                or symbol
+            ),
+            "direction": prediction[
+                "direction"
+            ],
+            "confidence": prediction[
+                "confidence"
+            ],
+            "historical_accuracy": backtest[
+                "accuracy"
+            ],
+            "backtest_samples": backtest[
+                "samples"
+            ],
+            "over_rate": prediction[
+                "over_rate"
+            ],
+            "under_rate": prediction[
+                "under_rate"
+            ],
+            "barrier": barrier,
+            "latest_price": latest,
+            "latest_digit": digits[-1],
+            "trend": trend,
+            "rsi": (
+                round(rsi, 2)
+                if rsi is not None
+                else None
+            ),
+            "volatility": (
+                round(volatility, 8)
+                if volatility is not None
+                else None
+            ),
+            "tradeable": tradeable,
+            "sample_size": len(prices),
+            "generated_at": utc_now_iso(),
+        }
+
+    except Exception:
+        return None
+
+
+async def analyze_live_markets(
+    force_fresh: bool = False,
+    barrier: int = DEFAULT_BARRIER,
+) -> List[Dict[str, Any]]:
+
+    cache_key = (
+        f"all:{barrier}"
     )
 
-    return {
-        "asset": symbol,
-        "symbol": candidate["symbol"],
-        "market": candidate["market"],
-
-        "direction": direction,
-
-        "confidence": confidence,
-
-        "tradeable": tradeable,
-
-        "historical_accuracy_pct":
-            backtest[
-                "accuracy_pct"
-            ],
-
-        "historical_samples":
-            backtest["samples"],
-
-        "historical_wins":
-            backtest["wins"],
-
-        "historical_losses":
-            backtest["losses"],
-
-        "skipped_historical":
-            backtest["skipped"],
-
-        "rsi":
-            round(
-                features["rsi"],
-                2
-            ),
-
-        "ema9":
-            features["ema9"],
-
-        "ema21":
-            features["ema21"],
-
-        "momentum_pct":
-            round(
-                features[
-                    "momentum_pct"
-                ],
-                6
-            ),
-
-        "micro_slope_pct":
-            round(
-                features[
-                    "micro_slope_pct"
-                ],
-                6
-            ),
-
-        "volatility_pct":
-            round(
-                features[
-                    "volatility_pct"
-                ],
-                6
-            ),
-
-        "price":
-            latest["price"],
-
-        "analysis_price":
-            features["price"],
-
-        "latest_price_change_pct":
-            round(
-                price_change,
-                6
-            ),
-
-        "latest_tick_time":
-            datetime.fromtimestamp(
-                latest["epoch"],
-                tz=timezone.utc
-            ).isoformat(),
-
-        "reason": (
-            "Fresh Deriv tick history was "
-            "evaluated using the transparent "
-            "directional rule. "
-            f"Out-of-sample accuracy: "
-            f"{backtest['accuracy_pct']:.2f}% "
-            f"over {backtest['samples']} "
-            "directional samples."
-        ),
-    }
-
-
-async def analyze_live_markets() -> Dict[str, Any]:
-
-    global PREDICTION_CACHE
-
-    now = time.time()
+    cached = PREDICTION_CACHE.get(
+        cache_key
+    )
 
     if (
-        PREDICTION_CACHE["data"]
-        is not None
-        and now
-        < PREDICTION_CACHE[
-            "expires_at"
-        ]
+        not force_fresh
+        and cached
+        and (
+            time.time()
+            - cached["timestamp"]
+            < PREDICTION_CACHE_SECONDS
+        )
     ):
-        return PREDICTION_CACHE[
-            "data"
-        ]
+        return cached["data"]
 
     symbols = await get_active_symbols()
 
-    candidates = select_candidate_symbols(
-        symbols
+    candidates = [
+        symbol
+        for symbol in symbols
+        if symbol_is_trade_candidate(symbol)
+    ]
+
+    # Avoid sending too many requests at once.
+    candidates = candidates[
+        :MAX_SYMBOLS_TO_ANALYZE
+    ]
+
+    tasks = [
+        analyze_symbol(
+            symbol,
+            barrier,
+        )
+        for symbol in candidates
+    ]
+
+    results = await asyncio.gather(
+        *tasks,
+        return_exceptions=True,
     )
 
-    if not candidates:
+    cleaned = [
+        result
+        for result in results
+        if isinstance(result, dict)
+    ]
 
-        raise RuntimeError(
-            "Deriv returned no eligible active CALL/PUT markets."
-        )
-
-    analyses = []
-    errors = []
-
-    for candidate in candidates:
-
-        try:
-
-            analyses.append(
-                await analyze_symbol(
-                    candidate
-                )
-            )
-
-        except Exception as exc:
-
-            errors.append(
-                {
-                    "symbol":
-                        candidate["asset"],
-                    "error":
-                        str(exc)[:240],
-                }
-            )
-
-    if not analyses:
-
-        raise RuntimeError(
-            "No market could be analyzed. "
-            f"Errors: {errors[:3]}"
-        )
-
-    analyses.sort(
-        key=lambda x: (
-            x["tradeable"],
-            x[
-                "historical_accuracy_pct"
-            ],
-            x["confidence"],
-            abs(
-                x["momentum_pct"]
+    cleaned.sort(
+        key=lambda item: (
+            bool(item.get("tradeable")),
+            item.get(
+                "confidence",
+                0,
+            ),
+            item.get(
+                "historical_accuracy",
+                0,
             ),
         ),
         reverse=True,
     )
 
-    for i, item in enumerate(
-        analyses
-    ):
+    if not force_fresh:
 
-        item["favourable"] = (
-            i == 0
-            and item["tradeable"]
-        )
-
-    result = {
-        "status": "live",
-        "source": "deriv_live_ticks",
-        "markets": analyses,
-        "errors": errors,
-        "generated_at": utc_now(),
-        "prediction_horizon_ticks":
-            PREDICTION_HORIZON_TICKS,
-        "minimum_edge_accuracy":
-            MIN_EDGE_ACCURACY,
-        "minimum_confidence":
-            MIN_CONFIDENCE_TO_TRADE,
-    }
-
-    PREDICTION_CACHE = {
-        "expires_at":
-            now
-            + PREDICTION_CACHE_SECONDS,
-        "data": result,
-    }
-
-    return result
-
-
-async def get_market_prediction() -> Dict[str, Any]:
-
-    data = await analyze_live_markets()
-
-    if (
-        data.get("status")
-        != "live"
-        or not data.get("markets")
-    ):
-
-        return {
-            "status": "unavailable",
-            "recommended_asset": None,
-            "predicted_direction": None,
-            "confidence_score": 0.0,
-            "source": "deriv_live_ticks",
-            "generated_at": utc_now(),
+        PREDICTION_CACHE[
+            cache_key
+        ] = {
+            "timestamp": time.time(),
+            "data": cleaned,
         }
 
-    top = data["markets"][0]
+    return cleaned
+
+
+async def get_market_prediction(
+    force_fresh: bool = False,
+    barrier: int = DEFAULT_BARRIER,
+) -> Dict[str, Any]:
+
+    markets = await analyze_live_markets(
+        force_fresh=force_fresh,
+        barrier=barrier,
+    )
+
+    if not markets:
+        return {
+            "direction": "NO TRADE",
+            "asset": None,
+            "confidence": 0,
+            "historical_accuracy": 0,
+            "tradeable": False,
+            "markets": [],
+            "reason": (
+                "No usable market data was available."
+            ),
+        }
+
+    tradeable = [
+        market
+        for market in markets
+        if market.get("tradeable")
+    ]
+
+    if not tradeable:
+
+        best = markets[0]
+
+        return {
+            **best,
+            "tradeable": False,
+            "direction": (
+                best.get("direction")
+                if best.get("confidence", 0)
+                >= 50
+                else "NO TRADE"
+            ),
+            "markets": markets,
+            "reason": (
+                "No market passed all trading filters."
+            ),
+        }
+
+    best = tradeable[0]
 
     return {
-        "status": "live",
-
-        "recommended_asset":
-            top["asset"],
-
-        "symbol":
-            top["symbol"],
-
-        "market":
-            top["market"],
-
-        "predicted_direction":
-            top["direction"],
-
-        "confidence_score":
-            top["confidence"],
-
-        "tradeable":
-            top["tradeable"],
-
-        "historical_accuracy_pct":
-            top[
-                "historical_accuracy_pct"
-            ],
-
-        "historical_samples":
-            top[
-                "historical_samples"
-            ],
-
-        "rsi_value":
-            top["rsi"],
-
-        "price":
-            top["price"],
-
-        "momentum_pct":
-            top["momentum_pct"],
-
-        "volatility_pct":
-            top["volatility_pct"],
-
-        "reason":
-            top["reason"],
-
-        "source":
-            "deriv_live_ticks",
-
-        "latest_tick_time":
-            top[
-                "latest_tick_time"
-            ],
-
-        "generated_at":
-            data["generated_at"],
+        **best,
+        "markets": markets,
+        "reason": (
+            "Market passed the configured "
+            "confidence and backtest filters."
+        ),
     }
 
 
 # ============================================================
-# ACCOUNT SYNCHRONISATION
+# PREDICTION ENDPOINT
 # ============================================================
 
-async def sync_deriv_accounts(
-    session: Dict[str, Any]
-) -> None:
+@app.get("/api/market/prediction")
+async def market_prediction(
+    barrier: int = Query(
+        default=DEFAULT_BARRIER,
+        ge=0,
+        le=9,
+    ),
+):
 
-    token = session.get(
-        "oauth_access_token"
+    prediction = await get_market_prediction(
+        force_fresh=True,
+        barrier=barrier,
     )
 
-    if not token:
-
-        raise RuntimeError(
-            "Deriv account is not connected."
-        )
-
-    accounts = await asyncio.to_thread(
-        get_deriv_accounts,
-        token
-    )
-
-    demo = get_account_from_list(
-        accounts,
-        "demo"
-    )
-
-    real = get_account_from_list(
-        accounts,
-        "real"
-    )
-
-    session["accounts"]["demo"] = demo
-    session["accounts"]["real"] = real
-
-    session["balances"]["demo"] = (
-        safe_float(
-            demo.get("balance")
-        )
-        if demo
-        else None
-    )
-
-    session["balances"]["real"] = (
-        safe_float(
-            real.get("balance")
-        )
-        if real
-        else None
-    )
-
-    session["connected"] = True
-
-    session["connection_status"] = (
-        "authorised"
-    )
+    return {
+        "status": "ok",
+        "prediction": prediction,
+        "generated_at": utc_now_iso(),
+    }
 
 
 # ============================================================
-# PROPOSAL
+# MARKETS ENDPOINT
 # ============================================================
 
-async def request_proposal(
+@app.get("/api/markets")
+async def markets_endpoint(
+    barrier: int = Query(
+        default=DEFAULT_BARRIER,
+        ge=0,
+        le=9,
+    ),
+):
+
+    markets = await analyze_live_markets(
+        force_fresh=True,
+        barrier=barrier,
+    )
+
+    return {
+        "status": "ok",
+        "markets": markets,
+        "count": len(markets),
+        "generated_at": utc_now_iso(),
+    }
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+def stats_for_account(
+    session: Dict[str, Any],
+    account: str,
+) -> Dict[str, Any]:
+
+    if account == "real":
+        return session["real_stats"]
+
+    return session["demo_stats"]
+
+
+def history_for_account(
+    session: Dict[str, Any],
+    account: str,
+) -> List[Dict[str, Any]]:
+
+    if account == "real":
+        return session["real_history"]
+
+    return session["demo_history"]
+
+
+def update_account_stats(
+    session: Dict[str, Any],
+    account: str,
+    profit: float,
+):
+
+    stats = stats_for_account(
+        session,
+        account,
+    )
+
+    stats["profit"] += profit
+    stats["trades"] += 1
+
+    if profit > 0:
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+
+    session["session_profit"] += profit
+    session["session_trades"] += 1
+
+    if profit > 0:
+
+        session["session_wins"] += 1
+        session["consecutive_losses"] = 0
+
+    else:
+
+        session["session_losses"] += 1
+        session["consecutive_losses"] += 1
+
+
+def add_history(
+    session: Dict[str, Any],
+    account: str,
+    record: Dict[str, Any],
+):
+
+    history = history_for_account(
+        session,
+        account,
+    )
+
+    history.insert(
+        0,
+        record,
+    )
+
+    del history[
+        MAX_HISTORY_RECORDS:
+    ]
+
+
+# ============================================================
+# TRADE CONTRACT
+# ============================================================
+
+def direction_to_contract(
+    direction: str,
+) -> str:
+
+    if direction == "OVER":
+        return "DIGITOVER"
+
+    if direction == "UNDER":
+        return "DIGITUNDER"
+
+    raise ValueError(
+        "Direction must be OVER or UNDER."
+    )
+
+
+def contract_status_is_final(
+    contract: Dict[str, Any],
+) -> bool:
+
+    status = str(
+        contract.get("status")
+        or ""
+    ).lower()
+
+    if status in {
+        "won",
+        "lost",
+        "sold",
+        "expired",
+        "cancelled",
+        "canceled",
+    }:
+        return True
+
+    if contract.get("is_sold"):
+        return True
+
+    if contract.get("is_expired"):
+        return True
+
+    return False
+
+
+def final_profit_from_contract(
+    contract: Dict[str, Any],
+) -> float:
+
+    profit = safe_float(
+        contract.get("profit")
+    )
+
+    if profit is not None:
+        return profit
+
+    buy_price = safe_float(
+        contract.get("buy_price")
+    )
+
+    payout = safe_float(
+        contract.get("payout")
+    )
+
+    if (
+        buy_price is not None
+        and payout is not None
+    ):
+        return payout - buy_price
+
+    return 0.0
+
+
+async def buy_and_monitor(
     session: Dict[str, Any],
     account: str,
     asset: str,
     direction: str,
     amount: float,
     duration: int,
+    barrier: int,
 ) -> Dict[str, Any]:
 
-    validate_account(account)
-
     token = session.get(
-        "oauth_access_token"
+        "access_token"
+    )
+
+    account_id = account_id_for(
+        session,
+        account,
     )
 
     if not token:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Connect your Deriv account "
-                "before requesting a proposal."
-            ),
+        raise RuntimeError(
+            "Deriv account is not connected."
         )
-
-    account_info = (
-        session["accounts"].get(
-            account
-        )
-    )
-
-    if not account_info:
-
-        await sync_deriv_accounts(
-            session
-        )
-
-        account_info = (
-            session["accounts"].get(
-                account
-            )
-        )
-
-    if not account_info:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"No Deriv {account} "
-                "Options account is available."
-            ),
-        )
-
-    account_id = account_info.get(
-        "account_id"
-    )
 
     if not account_id:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Deriv {account} account ID "
-                "is unavailable."
-            ),
+        raise RuntimeError(
+            f"No {account} Options account is available."
         )
 
-    direction = direction.upper()
-
-    if direction not in {
-        "CALL",
-        "PUT"
-    }:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Direction must be CALL or PUT."
-            ),
-        )
-
-    payload = {
-        "proposal": 1,
-        "amount": amount,
-        "basis": "stake",
-        "contract_type": direction,
-        "currency":
-            account_info.get(
-                "currency",
-                "USD"
-            ),
-        "duration": duration,
-        "duration_unit":
-            DEFAULT_DURATION_UNIT,
-        "underlying_symbol": asset,
-        "req_id": 3001,
-    }
-
-    return await authenticated_ws_request(
-        token,
-        account_id,
-        payload,
-        timeout=15,
+    contract_type = direction_to_contract(
+        direction
     )
 
-
-# ============================================================
-# BUY + MONITOR
-# ============================================================
-
-async def buy_and_monitor(
-    session: Dict[str, Any],
-    account: str,
-    proposal_id: str,
-    proposal_price: float,
-    duration: int,
-) -> Dict[str, Any]:
-
-    token = session.get(
-        "oauth_access_token"
+    currency = account_currency(
+        session,
+        account,
     )
 
-    account_info = (
-        session["accounts"].get(
-            account
-        )
-    )
-
-    if not token or not account_info:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Deriv account connection "
-                "is unavailable."
-            ),
-        )
-
-    account_id = account_info.get(
-        "account_id"
-    )
-
-    ws_url = await asyncio.to_thread(
-        get_deriv_otp,
+    ws_url = await get_deriv_otp(
         token,
         account_id,
     )
@@ -2410,1141 +2264,87 @@ async def buy_and_monitor(
     ) as ws:
 
         # ----------------------------------------------------
-        # AUTHORIZE
+        # 1. REQUEST FRESH PROPOSAL
         # ----------------------------------------------------
+
+        proposal_request = {
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": currency,
+            "duration": duration,
+            "duration_unit": DEFAULT_DURATION_UNIT,
+            "underlying_symbol": asset,
+            "barrier": str(barrier),
+            "req_id": random_req_id(),
+        }
 
         await ws.send(
             json.dumps(
-                {
-                    "authorize":
-                        token,
-                    "req_id": 4001,
-                }
+                proposal_request
             )
         )
 
-        authorized = False
+        proposal_response = None
 
         deadline = (
             time.monotonic()
             + 15
         )
 
-        while (
-            time.monotonic()
-            < deadline
-        ):
+        while time.monotonic() < deadline:
 
-            data = json.loads(
-                await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=15
-                )
+            remaining = max(
+                0.5,
+                deadline
+                - time.monotonic(),
             )
+
+            raw = await asyncio.wait_for(
+                ws.recv(),
+                timeout=remaining,
+            )
+
+            data = json.loads(raw)
 
             if data.get("error"):
 
+                error = data[
+                    "error"
+                ]
+
                 raise RuntimeError(
-                    data["error"].get(
+                    error.get(
                         "message",
-                        "Deriv authorization failed."
+                        "Proposal request failed.",
                     )
                 )
 
-            if (
-                data.get("msg_type")
-                == "authorize"
-            ):
+            if data.get(
+                "msg_type"
+            ) == "proposal":
 
-                authorized = True
+                proposal_response = data
                 break
 
-        if not authorized:
-
+        if not proposal_response:
             raise TimeoutError(
-                "Timed out authorizing Deriv."
+                "Timed out waiting for trade proposal."
             )
-
-        # ----------------------------------------------------
-        # BUY
-        # ----------------------------------------------------
-
-        await ws.send(
-            json.dumps(
-                {
-                    "buy":
-                        proposal_id,
-                    "price":
-                        proposal_price,
-                    "req_id": 4002,
-                }
-            )
-        )
-
-        buy_data = None
-
-        deadline = (
-            time.monotonic()
-            + 15
-        )
-
-        while (
-            time.monotonic()
-            < deadline
-        ):
-
-            data = json.loads(
-                await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=15
-                )
-            )
-
-            if data.get("error"):
-
-                raise RuntimeError(
-                    data["error"].get(
-                        "message",
-                        "Deriv buy failed."
-                    )
-                )
-
-            if (
-                data.get("msg_type")
-                == "buy"
-            ):
-
-                buy_data = data["buy"]
-                break
-
-        if not buy_data:
-
-            raise RuntimeError(
-                "Deriv did not return a buy response."
-            )
-
-        contract_id = buy_data.get(
-            "contract_id"
-        )
-
-        if not contract_id:
-
-            raise RuntimeError(
-                "Deriv buy response did not "
-                "contain a contract ID."
-            )
-
-        # ----------------------------------------------------
-        # MONITOR CONTRACT
-        # ----------------------------------------------------
-
-        await ws.send(
-            json.dumps(
-                {
-                    "proposal_open_contract":
-                        1,
-                    "contract_id":
-                        contract_id,
-                    "subscribe":
-                        1,
-                    "req_id":
-                        4003,
-                }
-            )
-        )
-
-        final_contract = None
-
-        deadline = (
-            time.monotonic()
-            + max(
-                30,
-                duration * 3 + 30
-            )
-        )
-
-        while (
-            time.monotonic()
-            < deadline
-        ):
-
-            try:
-
-                data = json.loads(
-                    await asyncio.wait_for(
-                        ws.recv(),
-                        timeout=15
-                    )
-                )
-
-            except asyncio.TimeoutError:
-
-                continue
-
-            if data.get("error"):
-
-                raise RuntimeError(
-                    data["error"].get(
-                        "message",
-                        "Contract monitoring failed."
-                    )
-                )
-
-            if (
-                data.get("msg_type")
-                != "proposal_open_contract"
-            ):
-                continue
-
-            contract = data.get(
-                "proposal_open_contract",
-                {}
-            )
-
-            final_contract = contract
-
-            status = str(
-                contract.get(
-                    "status",
-                    ""
-                )
-            ).lower()
-
-            if (
-                contract.get("is_sold")
-                or status in {
-                    "won",
-                    "lost",
-                    "sold",
-                    "expired",
-                }
-            ):
-                break
-
-        if final_contract is None:
-
-            raise RuntimeError(
-                "No final contract status "
-                "was received from Deriv."
-            )
-
-        return {
-            "contract_id":
-                contract_id,
-
-            "buy":
-                buy_data,
-
-            "contract":
-                final_contract,
-        }
-
-
-# ============================================================
-# ROOT / HEALTH
-# ============================================================
-
-@app.get("/")
-async def root():
-
-    return {
-        "status": "online",
-        "service":
-            "Fixed Risk Booster API",
-        "version":
-            APP_VERSION,
-        "broker":
-            "Deriv",
-        "product":
-            "Deriv Options",
-        "prediction_source":
-            "Deriv live ticks",
-        "time":
-            utc_now(),
-    }
-
-
-@app.head("/")
-async def root_head():
-    return None
-
-
-@app.get("/api/health")
-async def health():
-
-    return {
-        "status": "healthy",
-        "version":
-            APP_VERSION,
-        "broker":
-            "deriv",
-        "product":
-            "options",
-        "deriv_oauth_configured":
-            bool(
-                DERIV_CLIENT_ID
-                and DERIV_REDIRECT_URI
-            ),
-        "users_in_memory":
-            len(USER_SESSIONS),
-        "real_trading_enabled":
-            REAL_TRADING_ENABLED,
-        "time":
-            utc_now(),
-    }
-
-
-# ============================================================
-# SESSION
-# ============================================================
-
-@app.post("/api/session/register")
-async def register_session(
-    request: SessionRegisterRequest
-):
-
-    session = get_session(
-        request.user_id
-    )
-
-    return {
-        "status":
-            "registered",
-
-        "user_id":
-            request.user_id,
-
-        "connected":
-            session["connected"],
-
-        "connection_status":
-            session[
-                "connection_status"
-            ],
-
-        "balances":
-            session["balances"],
-
-        "accounts": {
-            "demo":
-                bool(
-                    session[
-                        "accounts"
-                    ]["demo"]
-                ),
-            "real":
-                bool(
-                    session[
-                        "accounts"
-                    ]["real"]
-                ),
-        },
-
-        "message":
-            (
-                "Application session registered. "
-                "Connect Deriv to access your "
-                "own Demo/Real Options accounts."
-            ),
-    }
-
-
-@app.get(
-    "/api/session/status/{user_id}"
-)
-async def session_status(
-    user_id: str
-):
-
-    session = require_session(
-        user_id
-    )
-
-    return {
-        "user_id":
-            user_id,
-
-        "connected":
-            session["connected"],
-
-        "connection_status":
-            session[
-                "connection_status"
-            ],
-
-        "account":
-            session["account"],
-
-        "accounts": {
-            "demo":
-                session[
-                    "accounts"
-                ]["demo"],
-
-            "real":
-                session[
-                    "accounts"
-                ]["real"],
-        },
-
-        "balances":
-            session["balances"],
-    }
-
-
-@app.post(
-    "/api/session/disconnect"
-)
-async def disconnect_session(
-    request: SessionRegisterRequest
-):
-
-    session = require_session(
-        request.user_id
-    )
-
-    # Stop NEW trades.
-    session["trading"] = False
-
-    # Remove server-side OAuth credentials.
-    session["oauth_access_token"] = None
-    session["oauth_refresh_token"] = None
-    session["oauth_expires_at"] = None
-
-    session["connected"] = False
-
-    session["connection_status"] = (
-        "not_connected"
-    )
-
-    session["accounts"] = {
-        "demo": None,
-        "real": None,
-    }
-
-    session["balances"] = {
-        "demo": None,
-        "real": None,
-    }
-
-    session["active_trade"] = None
-
-    return {
-        "status":
-            "disconnected",
-        "message":
-            (
-                "Deriv connection removed "
-                "from this application session."
-            ),
-    }
-
-
-# ============================================================
-# ACCOUNT BALANCE
-# ============================================================
-
-@app.get(
-    "/api/account/balance/{user_id}"
-)
-async def account_balance(
-    user_id: str
-):
-
-    session = require_session(
-        user_id
-    )
-
-    if session.get(
-        "oauth_access_token"
-    ):
-
-        try:
-
-            await sync_deriv_accounts(
-                session
-            )
-
-        except Exception as exc:
-
-            raise HTTPException(
-                status_code=502,
-                detail=str(exc)
-            )
-
-    return {
-        "demo": {
-            "balance":
-                session[
-                    "balances"
-                ]["demo"],
-
-            "verified":
-                session[
-                    "balances"
-                ]["demo"] is not None,
-        },
-
-        "real": {
-            "balance":
-                session[
-                    "balances"
-                ]["real"],
-
-            "verified":
-                session[
-                    "balances"
-                ]["real"] is not None,
-        },
-    }
-
-
-# ============================================================
-# MARKET ENDPOINTS
-# ============================================================
-
-@app.get(
-    "/api/market/prediction"
-)
-async def market_prediction():
-
-    try:
-
-        return await get_market_prediction()
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc)
-        )
-
-
-@app.get(
-    "/api/market/debug"
-)
-async def market_debug():
-
-    try:
-
-        data = await analyze_live_markets()
-
-        return {
-            "status":
-                data["status"],
-
-            "market_count":
-                len(
-                    data["markets"]
-                ),
-
-            "errors":
-                data["errors"][:10],
-
-            "source":
-                data["source"],
-
-            "generated_at":
-                data["generated_at"],
-
-            "prediction_horizon_ticks":
-                data[
-                    "prediction_horizon_ticks"
-                ],
-
-            "minimum_edge_accuracy":
-                data[
-                    "minimum_edge_accuracy"
-                ],
-
-            "minimum_confidence":
-                data[
-                    "minimum_confidence"
-                ],
-        }
-
-    except Exception as exc:
-
-        return {
-            "status":
-                "unavailable",
-
-            "market_count":
-                0,
-
-            "errors":
-                [str(exc)],
-
-            "source":
-                "deriv_live_ticks",
-
-            "generated_at":
-                utc_now(),
-        }
-
-
-@app.get("/api/markets")
-async def markets():
-
-    try:
-
-        data = await analyze_live_markets()
-
-        return {
-            "status":
-                data["status"],
-
-            "recommended_asset":
-                (
-                    data["markets"][0]["asset"]
-                    if data["markets"]
-                    else None
-                ),
-
-            "markets":
-                data["markets"],
-
-            "errors":
-                data["errors"],
-
-            "source":
-                data["source"],
-
-            "generated_at":
-                data["generated_at"],
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc)
-        )
-
-
-# ============================================================
-# TRADING SESSION
-# ============================================================
-
-@app.post(
-    "/api/trading/start"
-)
-async def start_trading(
-    request: TradingStartRequest
-):
-
-    validate_account(
-        request.account
-    )
-
-    session = require_session(
-        request.user_id
-    )
-
-    if not session.get(
-        "oauth_access_token"
-    ):
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Connect your Deriv account "
-                "before starting a trading session."
-            ),
-        )
-
-    if request.account == "real":
-
-        if not REAL_TRADING_ENABLED:
-
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Real trading is disabled "
-                    "on this server."
-                ),
-            )
-
-        if not request.real_market_mode:
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Real account requires explicit "
-                    "real_market_mode confirmation."
-                ),
-            )
-
-    await sync_deriv_accounts(
-        session
-    )
-
-    account_info = (
-        session["accounts"].get(
-            request.account
-        )
-    )
-
-    if not account_info:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"No verified Deriv "
-                f"{request.account} Options "
-                "account is available."
-            ),
-        )
-
-    balance = (
-        session["balances"].get(
-            request.account
-        )
-    )
-
-    if balance is None:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Deriv account balance "
-                "could not be verified."
-            ),
-        )
-
-    if balance < request.stake:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Insufficient account balance."
-            ),
-        )
-
-    # --------------------------------------------------------
-    # Reset CURRENT SESSION statistics.
-    #
-    # Account-wide statistics remain untouched.
-    # --------------------------------------------------------
-
-    session["trading"] = True
-
-    session["account"] = (
-        request.account
-    )
-
-    session["stake"] = round(
-        request.stake,
-        2
-    )
-
-    session["duration"] = (
-        request.duration
-    )
-
-    session["real_market_mode"] = (
-        request.real_market_mode
-    )
-
-    session["session_profit"] = 0.0
-    session["session_trades"] = 0
-    session["session_wins"] = 0
-    session["session_losses"] = 0
-    session["consecutive_losses"] = 0
-    session["active_trade"] = None
-
-    session["session_started_at"] = (
-        utc_now()
-    )
-
-    return {
-        "status":
-            "started",
-
-        "account":
-            request.account,
-
-        "stake":
-            session["stake"],
-
-        "balance":
-            balance,
-
-        "duration":
-            request.duration,
-
-        "duration_unit":
-            DEFAULT_DURATION_UNIT,
-
-        "session_started_at":
-            session[
-                "session_started_at"
-            ],
-    }
-
-
-@app.post(
-    "/api/trading/stop"
-)
-async def stop_trading(
-    request: TradingStopRequest
-):
-
-    session = require_session(
-        request.user_id
-    )
-
-    # This stops NEW trades.
-    #
-    # It does NOT cancel an Options contract
-    # that has already been purchased.
-    session["trading"] = False
-
-    active_trade = (
-        session["active_trade"]
-    )
-
-    return {
-        "status":
-            "stopped",
-
-        "account":
-            session["account"],
-
-        "new_trades_allowed":
-            False,
-
-        "active_trade":
-            active_trade,
-
-        "message":
-            (
-                "New trades are stopped. "
-                "Any contract already purchased "
-                "continues according to its Deriv "
-                "contract lifecycle."
-            ),
-
-        "session_profit":
-            round(
-                session[
-                    "session_profit"
-                ],
-                2
-            ),
-
-        "session_trades":
-            session[
-                "session_trades"
-            ],
-
-        "session_wins":
-            session[
-                "session_wins"
-            ],
-
-        "session_losses":
-            session[
-                "session_losses"
-            ],
-    }
-
-
-@app.get(
-    "/api/trading/status/{user_id}"
-)
-async def trading_status(
-    user_id: str
-):
-
-    session = require_session(
-        user_id
-    )
-
-    return {
-        "trading":
-            session["trading"],
-
-        "account":
-            session["account"],
-
-        "stake":
-            session["stake"],
-
-        "duration":
-            session["duration"],
-
-        "duration_unit":
-            DEFAULT_DURATION_UNIT,
-
-        "session_profit":
-            round(
-                session[
-                    "session_profit"
-                ],
-                2
-            ),
-
-        "session_trades":
-            session[
-                "session_trades"
-            ],
-
-        "session_wins":
-            session[
-                "session_wins"
-            ],
-
-        "session_losses":
-            session[
-                "session_losses"
-            ],
-
-        "consecutive_losses":
-            session[
-                "consecutive_losses"
-            ],
-
-        "active_trade":
-            session[
-                "active_trade"
-            ],
-    }
-
-
-# ============================================================
-# TRADE EXECUTION
-# ============================================================
-
-@app.post(
-    "/api/trade/execute"
-)
-async def execute_trade(
-    request: TradeRequest
-):
-
-    validate_account(
-        request.account
-    )
-
-    session = require_session(
-        request.user_id
-    )
-
-    # --------------------------------------------------------
-    # One trade at a time per user.
-    # --------------------------------------------------------
-
-    async with session["trade_lock"]:
-
-        # ----------------------------------------------------
-        # CHECK BEFORE ANY TRADE ACTION
-        # ----------------------------------------------------
-
-        if not session["trading"]:
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Trading session is not active."
-                ),
-            )
-
-        opening_stake = (
-            session["stake"]
-        )
-
-        # ----------------------------------------------------
-        # FIXED RISK
-        # ----------------------------------------------------
-
-        if (
-            round(
-                request.amount,
-                2
-            )
-            != round(
-                opening_stake,
-                2
-            )
-        ):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Fixed-risk violation: "
-                    "trade amount must equal "
-                    f"the active stake "
-                    f"({opening_stake:.2f})."
-                ),
-            )
-
-        if (
-            request.account
-            != session["account"]
-        ):
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Trade account does not "
-                    "match the active session."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # REAL MODE PROTECTION
-        # ----------------------------------------------------
-
-        if request.account == "real":
-
-            if not REAL_TRADING_ENABLED:
-
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        "Real trading is disabled "
-                        "on this server."
-                    ),
-                )
-
-            if not session[
-                "real_market_mode"
-            ]:
-
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        "Real trading requires "
-                        "explicit confirmation."
-                    ),
-                )
-
-        # ----------------------------------------------------
-        # CHECK CONNECTION
-        # ----------------------------------------------------
-
-        if not session.get(
-            "oauth_access_token"
-        ):
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Deriv account is not connected."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # FRESH LIVE PREDICTION
-        # ----------------------------------------------------
-        #
-        # The prediction is obtained immediately
-        # before the proposal request.
-        #
-        # The prediction cache only prevents excessive
-        # repeated requests during the short configured
-        # window. It does NOT use an old historical dataset
-        # as the live prediction source.
-        # ----------------------------------------------------
-
-        try:
-
-            prediction = (
-                await get_market_prediction()
-            )
-
-        except Exception as exc:
-
-            raise HTTPException(
-                status_code=503,
-                detail=str(exc)
-            )
-
-        if (
-            prediction.get("status")
-            != "live"
-        ):
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Live Deriv market data "
-                    "is unavailable."
-                ),
-            )
-
-        if not prediction.get(
-            "tradeable"
-        ):
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Prediction engine says "
-                    "NO TRADE. The current setup "
-                    "does not meet the configured "
-                    "accuracy and confidence thresholds."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # MARKET MUST MATCH CURRENT RECOMMENDATION
-        # ----------------------------------------------------
-
-        if (
-            request.asset
-            != prediction[
-                "recommended_asset"
-            ]
-        ):
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Market recommendation changed. "
-                    "Refresh the live signal."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # DIRECTION MUST MATCH
-        # ----------------------------------------------------
-
-        if (
-            request.direction.upper()
-            != prediction[
-                "predicted_direction"
-            ]
-        ):
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Trade direction does not "
-                    "match the current live prediction."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # REQUEST ACTUAL DERIV PROPOSAL
-        # ----------------------------------------------------
-
-        proposal_response = (
-            await request_proposal(
-                session=session,
-                account=request.account,
-                asset=request.asset,
-                direction=request.direction.upper(),
-                amount=opening_stake,
-                duration=request.duration,
-            )
-        )
 
         proposal = proposal_response.get(
             "proposal",
-            {}
+            {},
         )
+
+        if not isinstance(
+            proposal,
+            dict,
+        ):
+            raise RuntimeError(
+                "Invalid proposal response."
+            )
 
         proposal_id = proposal.get(
             "id"
@@ -3556,151 +2356,569 @@ async def execute_trade(
             )
         )
 
-        if (
-            not proposal_id
-            or ask_price is None
-        ):
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Deriv did not return "
-                    "a valid contract proposal."
-                ),
-            )
-
         payout = safe_float(
             proposal.get(
                 "payout"
             )
         )
 
-        spot = safe_float(
-            proposal.get(
-                "spot"
+        if not proposal_id:
+            raise RuntimeError(
+                "Deriv did not return a proposal ID."
+            )
+
+        if ask_price is None:
+            raise RuntimeError(
+                "Deriv did not return an ask price."
+            )
+
+        # ----------------------------------------------------
+        # 2. BUY
+        # ----------------------------------------------------
+
+        buy_request = {
+            "buy": str(proposal_id),
+            "price": ask_price,
+            "req_id": random_req_id(),
+        }
+
+        await ws.send(
+            json.dumps(
+                buy_request
             )
         )
 
-        if (
-            payout is None
-            or payout <= 0
+        buy_response = None
+
+        deadline = (
+            time.monotonic()
+            + 15
+        )
+
+        while time.monotonic() < deadline:
+
+            remaining = max(
+                0.5,
+                deadline
+                - time.monotonic(),
+            )
+
+            raw = await asyncio.wait_for(
+                ws.recv(),
+                timeout=remaining,
+            )
+
+            data = json.loads(raw)
+
+            if data.get("error"):
+
+                error = data[
+                    "error"
+                ]
+
+                raise RuntimeError(
+                    error.get(
+                        "message",
+                        "Buy request failed.",
+                    )
+                )
+
+            if data.get(
+                "msg_type"
+            ) == "buy":
+
+                buy_response = data
+                break
+
+        if not buy_response:
+            raise TimeoutError(
+                "Timed out waiting for Deriv buy confirmation."
+            )
+
+        buy_data = buy_response.get(
+            "buy",
+            {},
+        )
+
+        if not isinstance(
+            buy_data,
+            dict,
         ):
+            raise RuntimeError(
+                "Invalid buy response."
+            )
+
+        contract_id = buy_data.get(
+            "contract_id"
+        )
+
+        if not contract_id:
+            raise RuntimeError(
+                "Deriv did not return a contract ID."
+            )
+
+        buy_price = safe_float(
+            buy_data.get(
+                "buy_price"
+            ),
+            ask_price,
+        )
+
+        session["active_trade"] = {
+            "contract_id": str(
+                contract_id
+            ),
+            "asset": asset,
+            "direction": direction,
+            "contract_type": contract_type,
+            "account": account,
+            "amount": amount,
+            "duration": duration,
+            "duration_unit": DEFAULT_DURATION_UNIT,
+            "barrier": barrier,
+            "buy_price": buy_price,
+            "proposal_payout": payout,
+            "status": "open",
+            "started_at": utc_now_iso(),
+        }
+
+        # ----------------------------------------------------
+        # 3. MONITOR OPEN CONTRACT
+        # ----------------------------------------------------
+
+        monitor_request = {
+            "proposal_open_contract": 1,
+            "contract_id": contract_id,
+            "subscribe": 1,
+            "req_id": random_req_id(),
+        }
+
+        await ws.send(
+            json.dumps(
+                monitor_request
+            )
+        )
+
+        final_contract = None
+        subscription_id = None
+
+        timeout_seconds = max(
+            60,
+            duration * 10,
+        )
+
+        deadline = (
+            time.monotonic()
+            + timeout_seconds
+        )
+
+        while time.monotonic() < deadline:
+
+            remaining = max(
+                0.5,
+                deadline
+                - time.monotonic(),
+            )
+
+            try:
+
+                raw = await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=remaining,
+                )
+
+            except asyncio.TimeoutError:
+                break
+
+            data = json.loads(raw)
+
+            if data.get("error"):
+
+                error = data[
+                    "error"
+                ]
+
+                raise RuntimeError(
+                    error.get(
+                        "message",
+                        "Contract monitoring failed.",
+                    )
+                )
+
+            if (
+                data.get("msg_type")
+                != "proposal_open_contract"
+            ):
+                continue
+
+            contract = data.get(
+                "proposal_open_contract",
+                {},
+            )
+
+            if not isinstance(
+                contract,
+                dict,
+            ):
+                continue
+
+            subscription = data.get(
+                "subscription"
+            )
+
+            if isinstance(
+                subscription,
+                dict,
+            ):
+                subscription_id = (
+                    subscription.get("id")
+                )
+
+            current_profit = safe_float(
+                contract.get("profit"),
+                0.0,
+            )
+
+            session["active_trade"].update(
+                {
+                    "status": (
+                        contract.get(
+                            "status"
+                        )
+                        or "open"
+                    ),
+                    "profit": current_profit,
+                    "current_spot": (
+                        contract.get(
+                            "current_spot"
+                        )
+                    ),
+                    "payout": (
+                        contract.get(
+                            "payout"
+                        )
+                    ),
+                    "is_sold": bool(
+                        contract.get(
+                            "is_sold"
+                        )
+                    ),
+                    "is_expired": bool(
+                        contract.get(
+                            "is_expired"
+                        )
+                    ),
+                }
+            )
+
+            if contract_status_is_final(
+                contract
+            ):
+
+                final_contract = contract
+                break
+
+        # ----------------------------------------------------
+        # 4. RELEASE SUBSCRIPTION
+        # ----------------------------------------------------
+
+        if subscription_id:
+
+            try:
+
+                await ws.send(
+                    json.dumps(
+                        {
+                            "forget": (
+                                subscription_id
+                            ),
+                            "req_id": random_req_id(),
+                        }
+                    )
+                )
+
+            except Exception:
+                pass
+
+        if not final_contract:
+
+            # Contract may still exist on Deriv.
+            # Do not pretend it was a loss.
+            session["active_trade"][
+                "status"
+            ] = "monitor_timeout"
+
+            return {
+                "status": "monitor_timeout",
+                "contract_id": str(
+                    contract_id
+                ),
+                "asset": asset,
+                "direction": direction,
+                "account": account,
+                "amount": amount,
+                "buy_price": buy_price,
+                "proposal_payout": payout,
+                "message": (
+                    "Contract was purchased, "
+                    "but monitoring timed out. "
+                    "The contract was not automatically "
+                    "classified as a win or loss."
+                ),
+            }
+
+        profit = final_profit_from_contract(
+            final_contract
+        )
+
+        final_status = str(
+            final_contract.get(
+                "status"
+            )
+            or ""
+        ).lower()
+
+        won = (
+            final_status == "won"
+            or profit > 0
+        )
+
+        lost = (
+            final_status == "lost"
+            or profit <= 0
+        )
+
+        result = {
+            "status": (
+                "won"
+                if won
+                else "lost"
+            ),
+            "contract_id": str(
+                contract_id
+            ),
+            "asset": asset,
+            "direction": direction,
+            "contract_type": contract_type,
+            "account": account,
+            "amount": amount,
+            "duration": duration,
+            "duration_unit": DEFAULT_DURATION_UNIT,
+            "barrier": barrier,
+            "buy_price": buy_price,
+            "payout": (
+                safe_float(
+                    final_contract.get(
+                        "payout"
+                    )
+                )
+                or payout
+            ),
+            "profit": profit,
+            "final_status": final_status,
+            "exit_spot": (
+                final_contract.get(
+                    "exit_spot"
+                )
+            ),
+            "started_at": (
+                session["active_trade"]
+                .get("started_at")
+            ),
+            "completed_at": utc_now_iso(),
+        }
+
+        return result
+
+
+# ============================================================
+# EXECUTE TRADE
+# ============================================================
+
+@app.post("/api/trade/execute")
+async def execute_trade(
+    request: TradeRequest,
+):
+
+    session = require_session(
+        request.session_id
+    )
+
+    if not is_connected(session):
+        raise HTTPException(
+            status_code=400,
+            detail="Connect your Deriv account first.",
+        )
+
+    if request.account == "real":
+
+        if not REAL_TRADING_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real trading is disabled on the backend."
+                ),
+            )
+
+        if not session.get(
+            "real_market_mode"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real Market Mode is not enabled."
+                ),
+            )
+
+    if session.get("consecutive_losses", 0) >= MAX_CONSECUTIVE_LOSSES:
+
+        session["trading"] = False
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Trading automatically stopped after "
+                f"{MAX_CONSECUTIVE_LOSSES} consecutive losses."
+            ),
+        )
+
+    if session.get("active_trade"):
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "An Options contract is already active."
+            ),
+        )
+
+    if request.direction == "NO TRADE":
+
+        return {
+            "status": "no_trade",
+            "message": (
+                "NO TRADE prediction. "
+                "No contract was purchased."
+            ),
+        }
+
+    if request.amount <= 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Stake must be greater than zero.",
+        )
+
+    if request.amount > MAX_STAKE:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Stake exceeds backend maximum of "
+                f"{MAX_STAKE}."
+            ),
+        )
+
+    balance = session["balances"].get(
+        request.account
+    )
+
+    if balance is None:
+
+        balance = await refresh_account_balance(
+            session,
+            request.account,
+        )
+
+    if (
+        balance is not None
+        and request.amount > balance
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Stake is greater than the "
+                "available account balance."
+            ),
+        )
+
+    async with session["trade_lock"]:
+
+        if session.get("active_trade"):
 
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Deriv returned no usable "
-                    "payout. Trade skipped."
+                    "Another trade became active "
+                    "before execution."
                 ),
             )
 
         # ----------------------------------------------------
-        # BREAK-EVEN CALCULATION
+        # FRESH PREDICTION AT ACTUAL TRADE TIME
         # ----------------------------------------------------
 
-        break_even_probability = (
-            ask_price / payout
-            if payout > 0
-            else None
+        prediction = await get_market_prediction(
+            force_fresh=True,
+            barrier=request.barrier,
         )
 
-        if (
-            break_even_probability
-            is not None
+        predicted_direction = prediction.get(
+            "direction"
+        )
+
+        predicted_asset = prediction.get(
+            "asset"
+        )
+
+        if not prediction.get(
+            "tradeable"
         ):
 
-            historical_probability = (
-                prediction[
-                    "historical_accuracy_pct"
-                ]
-                / 100.0
-            )
+            return {
+                "status": "no_trade",
+                "prediction": prediction,
+                "message": (
+                    "Current live analysis did not "
+                    "pass the trading filters."
+                ),
+            }
 
-            # 3 percentage point buffer.
-            required_probability = (
-                break_even_probability
-                + 0.03
-            )
+        if (
+            predicted_asset != request.asset
+            or predicted_direction != request.direction
+        ):
 
-            if (
-                historical_probability
-                <= required_probability
-            ):
-
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Trade skipped: measured "
-                        "historical accuracy does not "
-                        "clear the current Deriv "
-                        "contract break-even threshold "
-                        "by the configured buffer."
-                    ),
-                )
+            return {
+                "status": "no_trade",
+                "prediction": prediction,
+                "message": (
+                    "The requested trade no longer "
+                    "matches the fresh live prediction. "
+                    "No contract was purchased."
+                ),
+            }
 
         # ----------------------------------------------------
-        # RECORD ACTIVE TRADE
+        # EXECUTE
         # ----------------------------------------------------
 
-        session["active_trade"] = {
-            "asset":
-                request.asset,
+        session["account"] = request.account
+        session["stake"] = request.amount
+        session["duration"] = request.duration
 
-            "direction":
-                request.direction.upper(),
-
-            "account":
-                request.account,
-
-            "stake":
-                opening_stake,
-
-            "duration":
-                request.duration,
-
-            "duration_unit":
-                DEFAULT_DURATION_UNIT,
-
-            "proposal_id":
-                proposal_id,
-
-            "payout":
-                payout,
-
-            "ask_price":
-                ask_price,
-
-            "spot":
-                spot,
-
-            "prediction_confidence":
-                prediction[
-                    "confidence_score"
-                ],
-
-            "historical_accuracy_pct":
-                prediction[
-                    "historical_accuracy_pct"
-                ],
-
-            "started_at":
-                utc_now(),
-        }
-
-        # ----------------------------------------------------
-        # BUY + MONITOR
-        # ----------------------------------------------------
+        session["last_prediction"] = prediction
 
         try:
 
-            execution = (
-                await buy_and_monitor(
-                    session=session,
-                    account=request.account,
-                    proposal_id=proposal_id,
-                    proposal_price=ask_price,
-                    duration=request.duration,
-                )
+            result = await buy_and_monitor(
+                session=session,
+                account=request.account,
+                asset=request.asset,
+                direction=request.direction,
+                amount=request.amount,
+                duration=request.duration,
+                barrier=request.barrier,
             )
 
         except Exception as exc:
@@ -3709,459 +2927,396 @@ async def execute_trade(
 
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Deriv execution failed: {exc}"
-                ),
+                detail=str(exc),
             )
 
-        contract = execution[
-            "contract"
-        ]
+        # ----------------------------------------------------
+        # CONTRACT PURCHASED BUT MONITORING TIMED OUT
+        # ----------------------------------------------------
+
+        if result.get(
+            "status"
+        ) == "monitor_timeout":
+
+            # Do not classify this as a loss.
+            # The contract remains a real Deriv contract.
+            return {
+                "status": "monitor_timeout",
+                "trade": result,
+                "prediction": prediction,
+                "message": (
+                    "The contract was purchased, "
+                    "but its final result was not "
+                    "confirmed by the monitor."
+                ),
+            }
+
+        # ----------------------------------------------------
+        # FINAL RESULT
+        # ----------------------------------------------------
 
         profit = safe_float(
-            contract.get(
-                "profit"
-            ),
-            0.0
+            result.get("profit"),
+            0.0,
         ) or 0.0
 
-        status = str(
-            contract.get(
-                "status",
-                ""
-            )
-        ).lower()
+        update_account_stats(
+            session,
+            request.account,
+            profit,
+        )
 
-        if (
-            status == "won"
-            or profit > 0
-        ):
-
-            result = "WIN"
-
-        elif (
-            status == "lost"
-            or profit < 0
-        ):
-
-            result = "LOSS"
-
-        else:
-
-            result = "CLOSED"
-
-        # ----------------------------------------------------
-        # UPDATE SESSION STATS
-        # ----------------------------------------------------
-
-        session[
-            "session_trades"
-        ] += 1
-
-        session[
-            "session_profit"
-        ] += profit
-
-        # ----------------------------------------------------
-        # UPDATE ACCOUNT-WIDE STATS
-        # ----------------------------------------------------
-
-        stats = session[
-            f"{request.account}_stats"
-        ]
-
-        stats["profit"] += profit
-
-        stats["trades"] += 1
-
-        if result == "WIN":
-
-            session[
-                "session_wins"
-            ] += 1
-
-            session[
-                "consecutive_losses"
-            ] = 0
-
-            stats["wins"] += 1
-
-        elif result == "LOSS":
-
-            session[
-                "session_losses"
-            ] += 1
-
-            session[
-                "consecutive_losses"
-            ] += 1
-
-            stats["losses"] += 1
-
-        # ----------------------------------------------------
-        # TRADE RECORD
-        # ----------------------------------------------------
-
-        trade = {
-            "order_id":
-                str(
-                    execution[
-                        "contract_id"
-                    ]
-                ),
-
-            "contract_id":
-                execution[
-                    "contract_id"
-                ],
-
-            "account":
-                request.account,
-
-            "asset":
-                request.asset,
-
-            "direction":
-                request.direction.upper(),
-
-            "stake":
-                opening_stake,
-
-            "duration":
-                request.duration,
-
-            "duration_unit":
-                DEFAULT_DURATION_UNIT,
-
-            "result":
-                result,
-
-            "profit":
-                round(
-                    profit,
-                    2
-                ),
-
-            "proposal_payout":
-                payout,
-
-            "proposal_ask_price":
-                ask_price,
-
-            "break_even_probability_pct":
-                (
-                    round(
-                        break_even_probability
-                        * 100.0,
-                        2
-                    )
-                    if break_even_probability
-                    is not None
-                    else None
-                ),
-
-            "prediction_confidence":
-                prediction[
-                    "confidence_score"
-                ],
-
-            "historical_accuracy_pct":
-                prediction[
-                    "historical_accuracy_pct"
-                ],
-
-            "historical_samples":
-                prediction[
-                    "historical_samples"
-                ],
-
-            "timestamp":
-                utc_now(),
+        history_record = {
+            **result,
+            "prediction_confidence": prediction.get(
+                "confidence"
+            ),
+            "historical_accuracy": prediction.get(
+                "historical_accuracy"
+            ),
         }
 
-        history_key = (
-            f"{request.account}_history"
-        )
-
-        session[
-            history_key
-        ].insert(
-            0,
-            trade
-        )
-
-        session[
-            history_key
-        ] = session[
-            history_key
-        ][:MAX_HISTORY_PER_ACCOUNT]
-
-        session["last_trade_at"] = (
-            trade["timestamp"]
+        add_history(
+            session,
+            request.account,
+            history_record,
         )
 
         session["active_trade"] = None
 
-        # ----------------------------------------------------
-        # LOSS PROTECTION
-        # ----------------------------------------------------
+        await refresh_account_balance(
+            session,
+            request.account,
+        )
 
-        protection_message = None
+        # ----------------------------------------------------
+        # 3-LOSS PROTECTION
+        # ----------------------------------------------------
 
         if (
-            session[
-                "consecutive_losses"
-            ]
+            session["consecutive_losses"]
             >= MAX_CONSECUTIVE_LOSSES
         ):
 
             session["trading"] = False
 
-            protection_message = (
-                "Trading session automatically "
-                f"stopped after "
-                f"{MAX_CONSECUTIVE_LOSSES} "
-                "consecutive losses."
-            )
-
-        # ----------------------------------------------------
-        # REFRESH ACTUAL DERIV BALANCE
-        # ----------------------------------------------------
-
-        try:
-
-            await sync_deriv_accounts(
-                session
-            )
-
-        except Exception:
-            pass
-
         return {
-            "status":
-                "completed",
-
-            "order_id":
-                str(
-                    execution[
-                        "contract_id"
-                    ]
-                ),
-
-            "contract_id":
-                execution[
-                    "contract_id"
-                ],
-
-            "account":
+            "status": "completed",
+            "trade": result,
+            "prediction": prediction,
+            "stats": stats_for_account(
+                session,
                 request.account,
-
-            "asset":
-                request.asset,
-
-            "direction":
-                request.direction.upper(),
-
-            "stake":
-                opening_stake,
-
-            "result":
-                result,
-
-            "profit":
-                round(
-                    profit,
-                    2
-                ),
-
-            "remaining_balance":
-                session[
-                    "balances"
-                ].get(
-                    request.account
-                ),
-
-            "session_profit":
-                round(
-                    session[
-                        "session_profit"
-                    ],
-                    2
-                ),
-
-            "session_trades":
-                session[
-                    "session_trades"
-                ],
-
-            "session_wins":
-                session[
-                    "session_wins"
-                ],
-
-            "session_losses":
-                session[
-                    "session_losses"
-                ],
-
-            "consecutive_losses":
-                session[
-                    "consecutive_losses"
-                ],
-
-            "trading":
-                session["trading"],
-
-            "protection_message":
-                protection_message,
-
-            "deriv_contract": {
-                "status":
-                    contract.get(
-                        "status"
-                    ),
-
-                "payout":
-                    contract.get(
-                        "payout"
-                    ),
-
-                "buy_price":
-                    contract.get(
-                        "buy_price"
-                    ),
-
-                "sell_price":
-                    contract.get(
-                        "sell_price"
-                    ),
-
-                "entry_spot":
-                    contract.get(
-                        "entry_spot"
-                    ),
-
-                "exit_tick":
-                    contract.get(
-                        "exit_tick"
-                    ),
-            },
+            ),
+            "balance": session[
+                "balances"
+            ].get(
+                request.account
+            ),
+            "trading": session["trading"],
+            "consecutive_losses": session[
+                "consecutive_losses"
+            ],
         }
 
 
 # ============================================================
-# TRADE HISTORY
+# START TRADING
 # ============================================================
 
-@app.get(
-    "/api/trades/{user_id}"
-)
-async def trade_history(
-    user_id: str,
-    account: str = "demo"
+@app.post("/api/trading/start")
+async def start_trading(
+    request: TradingStartRequest,
 ):
 
-    validate_account(
-        account
+    session = require_session(
+        request.session_id
     )
 
-    session = require_session(
-        user_id
-    )
+    if not is_connected(session):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Connect your Deriv account before "
+                "starting trading."
+            ),
+        )
+
+    if request.account == "real":
+
+        if not REAL_TRADING_ENABLED:
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real trading is disabled by "
+                    "the backend."
+                ),
+            )
+
+        if not request.real_market_mode:
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real Market Mode confirmation is required."
+                ),
+            )
+
+        if not session["accounts"].get(
+            "real"
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No Real Options account is available."
+                ),
+            )
+
+        session["real_market_mode"] = True
+
+    else:
+
+        session["real_market_mode"] = False
+
+    if session["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Trading is locked after "
+                f"{MAX_CONSECUTIVE_LOSSES} consecutive losses."
+            ),
+        )
+
+    session["account"] = request.account
+    session["stake"] = request.stake
+    session["duration"] = request.duration
+    session["duration_unit"] = DEFAULT_DURATION_UNIT
+
+    session["trading"] = True
 
     return {
-        "account":
-            account,
-
-        "trades":
-            session[
-                f"{account}_history"
-            ],
+        "status": "started",
+        "trading": True,
+        "account": session["account"],
+        "stake": session["stake"],
+        "duration": session["duration"],
+        "duration_unit": session[
+            "duration_unit"
+        ],
+        "real_market_mode": session[
+            "real_market_mode"
+        ],
+        "message": (
+            "Trading started. The frontend should "
+            "request the next trade only when there "
+            "is no active contract."
+        ),
     }
 
 
 # ============================================================
-# ACCOUNT STATISTICS
+# STOP TRADING
 # ============================================================
 
-@app.get(
-    "/api/stats/{user_id}"
-)
-async def statistics(
-    user_id: str,
-    account: str = "demo"
+@app.post("/api/trading/stop")
+async def stop_trading(
+    request: TradingStopRequest,
 ):
 
-    validate_account(
-        account
+    session = require_session(
+        request.session_id
     )
+
+    session["trading"] = False
+
+    active_trade = session.get(
+        "active_trade"
+    )
+
+    if active_trade:
+
+        message = (
+            "New trades have been stopped. "
+            "The already-purchased contract remains "
+            "active and will continue to its Deriv outcome."
+        )
+
+    else:
+
+        message = (
+            "Trading stopped. No new contracts will "
+            "be opened."
+        )
+
+    return {
+        "status": "stopped",
+        "trading": False,
+        "active_trade": active_trade,
+        "message": message,
+    }
+
+
+# ============================================================
+# TRADING STATUS
+# ============================================================
+
+@app.get("/api/trading/status/{session_id}")
+async def trading_status(
+    session_id: str,
+):
 
     session = require_session(
-        user_id
+        session_id
     )
 
-    stats = session[
-        f"{account}_stats"
-    ]
+    return {
+        "status": "ok",
+        "trading": session["trading"],
+        "account": session["account"],
+        "stake": session["stake"],
+        "duration": session["duration"],
+        "duration_unit": session[
+            "duration_unit"
+        ],
+        "real_market_mode": session[
+            "real_market_mode"
+        ],
+        "consecutive_losses": session[
+            "consecutive_losses"
+        ],
+        "active_trade": session[
+            "active_trade"
+        ],
+        "last_prediction": session[
+            "last_prediction"
+        ],
+    }
 
-    trades = stats[
-        "trades"
-    ]
 
-    wins = stats[
-        "wins"
-    ]
+# ============================================================
+# BALANCE
+# ============================================================
+
+@app.get("/api/account/balance/{session_id}")
+async def account_balance(
+    session_id: str,
+):
+
+    session = require_session(
+        session_id
+    )
+
+    if not is_connected(session):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Deriv account is not connected.",
+        )
+
+    await refresh_all_balances(
+        session
+    )
+
+    return {
+        "status": "ok",
+        "balances": {
+            "demo": session[
+                "balances"
+            ].get("demo"),
+            "real": session[
+                "balances"
+            ].get("real"),
+        },
+    }
+
+
+# ============================================================
+# STATS ENDPOINT
+# ============================================================
+
+@app.get("/api/stats/{session_id}")
+async def stats_endpoint(
+    session_id: str,
+    account: str = Query(
+        default="demo",
+        pattern="^(demo|real)$",
+    ),
+):
+
+    session = require_session(
+        session_id
+    )
+
+    stats = stats_for_account(
+        session,
+        account,
+    )
+
+    total = stats["trades"]
 
     win_rate = (
-        round(
-            (
-                wins
-                / trades
-            )
-            * 100.0,
-            2
-        )
-        if trades
-        else 0.0
+        stats["wins"]
+        / total
+        * 100
+        if total
+        else 0
     )
 
     return {
-        "account":
-            account,
-
-        "profit":
-            round(
-                stats["profit"],
-                2
+        "status": "ok",
+        "account": account,
+        "stats": {
+            **stats,
+            "win_rate": round(
+                win_rate,
+                2,
             ),
-
-        "trades":
-            trades,
-
-        "wins":
-            wins,
-
-        "losses":
-            stats["losses"],
-
-        "win_rate":
-            win_rate,
+        },
     }
 
 
 # ============================================================
-# COMBINED DASHBOARD DATA
+# HISTORY ENDPOINT
 # ============================================================
 
-@app.get(
-    "/api/dashboard/{user_id}"
-)
-async def dashboard(
-    user_id: str
+@app.get("/api/trades/{session_id}")
+async def trades_endpoint(
+    session_id: str,
+    account: str = Query(
+        default="demo",
+        pattern="^(demo|real)$",
+    ),
 ):
 
     session = require_session(
-        user_id
+        session_id
+    )
+
+    return {
+        "status": "ok",
+        "account": account,
+        "history": history_for_account(
+            session,
+            account,
+        ),
+    }
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@app.get("/api/dashboard/{session_id}")
+async def dashboard(
+    session_id: str,
+):
+
+    session = require_session(
+        session_id
     )
 
     demo_stats = session[
@@ -4172,148 +3327,280 @@ async def dashboard(
         "real_stats"
     ]
 
-    def make_stats(stats):
+    demo_total = demo_stats[
+        "trades"
+    ]
 
-        trades = stats[
-            "trades"
-        ]
+    real_total = real_stats[
+        "trades"
+    ]
 
-        wins = stats[
-            "wins"
-        ]
+    demo_win_rate = (
+        demo_stats["wins"]
+        / demo_total
+        * 100
+        if demo_total
+        else 0
+    )
 
-        return {
-            "profit":
-                round(
-                    stats[
-                        "profit"
-                    ],
-                    2
-                ),
-
-            "trades":
-                trades,
-
-            "wins":
-                wins,
-
-            "losses":
-                stats[
-                    "losses"
-                ],
-
-            "win_rate":
-                (
-                    round(
-                        wins
-                        / trades
-                        * 100.0,
-                        2
-                    )
-                    if trades
-                    else 0.0
-                ),
-        }
+    real_win_rate = (
+        real_stats["wins"]
+        / real_total
+        * 100
+        if real_total
+        else 0
+    )
 
     return {
-        "user_id":
-            user_id,
+        "status": "ok",
 
-        "connected":
-            session["connected"],
+        "connected": session[
+            "connected"
+        ],
 
-        "connection_status":
-            session[
-                "connection_status"
-            ],
+        "connection_status": session[
+            "connection_status"
+        ],
 
-        "selected_account":
-            session["account"],
+        "accounts": sanitize_accounts(
+            session
+        ),
 
         "balances": {
-            "demo":
-                session[
-                    "balances"
-                ]["demo"],
-
-            "real":
-                session[
-                    "balances"
-                ]["real"],
+            "demo": session[
+                "balances"
+            ].get("demo"),
+            "real": session[
+                "balances"
+            ].get("real"),
         },
 
-        "demo": {
-            "stats":
-                make_stats(
-                    demo_stats
-                ),
+        "account": session[
+            "account"
+        ],
 
-            "history":
-                session[
-                    "demo_history"
-                ],
+        "trading": session[
+            "trading"
+        ],
+
+        "stake": session[
+            "stake"
+        ],
+
+        "duration": session[
+            "duration"
+        ],
+
+        "duration_unit": session[
+            "duration_unit"
+        ],
+
+        "real_market_mode": session[
+            "real_market_mode"
+        ],
+
+        # Session stats
+        "session": {
+            "profit": session[
+                "session_profit"
+            ],
+            "trades": session[
+                "session_trades"
+            ],
+            "wins": session[
+                "session_wins"
+            ],
+            "losses": session[
+                "session_losses"
+            ],
+            "consecutive_losses": session[
+                "consecutive_losses"
+            ],
+        },
+
+        # Demo and Real remain separate.
+        "demo": {
+            "stats": {
+                **demo_stats,
+                "win_rate": round(
+                    demo_win_rate,
+                    2,
+                ),
+            },
+            "history": session[
+                "demo_history"
+            ],
         },
 
         "real": {
-            "stats":
-                make_stats(
-                    real_stats
+            "stats": {
+                **real_stats,
+                "win_rate": round(
+                    real_win_rate,
+                    2,
                 ),
-
-            "history":
-                session[
-                    "real_history"
-                ],
+            },
+            "history": session[
+                "real_history"
+            ],
         },
 
-        "trading": {
-            "active":
-                session["trading"],
+        "active_trade": session[
+            "active_trade"
+        ],
 
-            "account":
-                session["account"],
-
-            "stake":
-                session["stake"],
-
-            "duration":
-                session[
-                    "duration"
-                ],
-
-            "session_profit":
-                round(
-                    session[
-                        "session_profit"
-                    ],
-                    2
-                ),
-
-            "session_trades":
-                session[
-                    "session_trades"
-                ],
-
-            "session_wins":
-                session[
-                    "session_wins"
-                ],
-
-            "session_losses":
-                session[
-                    "session_losses"
-                ],
-
-            "active_trade":
-                session[
-                    "active_trade"
-                ],
-        },
+        "last_prediction": session[
+            "last_prediction"
+        ],
     }
 
 
 # ============================================================
-# SERVER
+# DISCONNECT
+# ============================================================
+
+@app.post("/api/session/disconnect")
+async def disconnect_session(
+    request: DisconnectRequest,
+):
+
+    session = require_session(
+        request.session_id
+    )
+
+    # Do not destroy an active trade record.
+    # A purchased Deriv contract continues independently.
+    if session.get("active_trade"):
+
+        session["connected"] = False
+        session[
+            "connection_status"
+        ] = "disconnected_with_active_trade"
+
+        session["access_token"] = None
+        session["refresh_token"] = None
+        session["token_expires_at"] = None
+
+        session["trading"] = False
+
+        return {
+            "status": "disconnected",
+            "trading": False,
+            "active_trade": session[
+                "active_trade"
+            ],
+            "message": (
+                "Deriv connection removed. "
+                "The existing contract record was preserved."
+            ),
+        }
+
+    session["connected"] = False
+    session[
+        "connection_status"
+    ] = "disconnected"
+
+    session["access_token"] = None
+    session["refresh_token"] = None
+    session["token_expires_at"] = None
+
+    session["accounts"] = {
+        "demo": None,
+        "real": None,
+    }
+
+    session["balances"] = {
+        "demo": None,
+        "real": None,
+    }
+
+    session["account_currencies"] = {
+        "demo": "USD",
+        "real": "USD",
+    }
+
+    session["trading"] = False
+    session["real_market_mode"] = False
+
+    return {
+        "status": "disconnected",
+        "trading": False,
+        "active_trade": None,
+        "message": (
+            "Deriv account disconnected."
+        ),
+    }
+
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(
+    request,
+    exc,
+):
+
+    # Do not expose Python tracebacks or tokens to the frontend.
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "message": str(exc),
+        },
+    )
+
+
+# ============================================================
+# IMPORT REQUIRED FOR ERROR HANDLER
+# ============================================================
+
+from fastapi.responses import JSONResponse
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    print(
+        f"[Fixed Risk Booster] v{APP_VERSION} starting..."
+    )
+
+    print(
+        "[Fixed Risk Booster] Deriv OAuth:",
+        bool(DERIV_CLIENT_ID),
+    )
+
+    print(
+        "[Fixed Risk Booster] Redirect URI:",
+        bool(DERIV_REDIRECT_URI),
+    )
+
+    print(
+        "[Fixed Risk Booster] Frontend origin:",
+        FRONTEND_ORIGIN or "(not configured)",
+    )
+
+    print(
+        "[Fixed Risk Booster] Real trading:",
+        "ENABLED"
+        if REAL_TRADING_ENABLED
+        else "DISABLED",
+    )
+
+    print(
+        "[Fixed Risk Booster] Default duration:",
+        DEFAULT_DURATION,
+        DEFAULT_DURATION_UNIT,
+    )
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -4323,12 +3610,13 @@ if __name__ == "__main__":
     port = int(
         os.getenv(
             "PORT",
-            "10000"
+            "8000",
         )
     )
 
     uvicorn.run(
-        app,
+        "app:app",
         host="0.0.0.0",
         port=port,
+        reload=False,
     )
