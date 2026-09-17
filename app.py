@@ -1,4 +1,3 @@
-```python
 # ============================================================
 # FIXED RISK BOOSTER
 # Deriv Options Multi-User Backend
@@ -3760,4 +3759,3 @@ if __name__ == "__main__":
         port=port,
         reload=False,
     )
-```
