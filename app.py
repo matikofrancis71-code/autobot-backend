@@ -1492,7 +1492,7 @@ async def deriv_login(session_id: str = Query(...)):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    authorization_url = f"{DERIV_AUTH_BASE}/oauth2/authorize?" + urllib.parse.urlencode(params)
+    authorization_url = f"{DERIV_AUTH_BASE}/oauth2/auth?" + urllib.parse.urlencode(params)
     return {"status": "ok", "authorization_url": authorization_url}
 
 
