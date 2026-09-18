@@ -6107,6 +6107,60 @@ async def trading_status(
         )
     )
 
+    stats_key = (
+        "demo_stats"
+        if account == "demo"
+        else "real_stats"
+    )
+
+    history_key = (
+        "demo_history"
+        if account == "demo"
+        else "real_history"
+    )
+
+    selected_stats = session.get(
+        stats_key,
+        new_stats(),
+    )
+
+    selected_history = session.get(
+        history_key,
+        [],
+    )
+
+    # Only expose the active trade belonging to the currently
+    # selected account. This prevents a Demo contract from
+    # appearing while Real is selected, or vice versa.
+    active_trade = session.get(
+        "active_trade"
+    )
+
+    if (
+        active_trade
+        and normalize_account_type(
+            active_trade.get(
+                "account",
+                account,
+            )
+        ) != account
+    ):
+        active_trade = None
+
+    trades_count = int(
+        selected_stats.get(
+            "trades",
+            0,
+        )
+    )
+
+    wins_count = int(
+        selected_stats.get(
+            "wins",
+            0,
+        )
+    )
+
     return {
         "status": "ok",
 
@@ -6116,13 +6170,53 @@ async def trading_status(
 
         "account": account,
 
+        "account_id": session[
+            "accounts"
+        ].get(
+            account
+        ),
+
+        "balance": session[
+            "balances"
+        ].get(
+            account
+        ),
+
+        "stats": {
+            "profit": round(
+                float(
+                    selected_stats.get(
+                        "profit",
+                        0.0,
+                    )
+                ),
+                2,
+            ),
+            "trades": trades_count,
+            "wins": wins_count,
+            "losses": int(
+                selected_stats.get(
+                    "losses",
+                    0,
+                )
+            ),
+            "win_rate": round(
+                wins_count / trades_count * 100
+                if trades_count
+                else 0.0,
+                2,
+            ),
+        },
+
+        "history": list(
+            selected_history
+        ),
+
         "real_market_mode": session[
             "real_market_mode"
         ],
 
-        "active_trade": session[
-            "active_trade"
-        ],
+        "active_trade": active_trade,
 
         "consecutive_losses": (
             get_consecutive_losses(
@@ -6229,8 +6323,36 @@ async def start_trading(
                 ),
             )
 
-    # Switching account resets only the currently
-    # selected account's trading configuration.
+    # Never allow the selected account to change while a
+    # contract belonging to the other account is active.
+    # This keeps Demo and Real state completely isolated.
+    active_trade = session.get(
+        "active_trade"
+    )
+
+    if active_trade:
+
+        active_account = normalize_account_type(
+            active_trade.get(
+                "account",
+                session.get(
+                    "account",
+                    "demo",
+                ),
+            )
+        )
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A {active_account} trade is already active. "
+                "Wait for it to finish before switching "
+                "accounts or starting another trade."
+            ),
+        )
+
+    # Select the account before execution so every operation
+    # below uses exactly the account requested by the UI.
     session[
         "account"
     ] = account
@@ -6253,7 +6375,6 @@ async def start_trading(
         else False
     )
 
-    # Keep compatibility field synchronized.
     session[
         "consecutive_losses"
     ] = get_consecutive_losses(
@@ -6265,16 +6386,73 @@ async def start_trading(
         "trading"
     ] = True
 
+    # START TRADING immediately executes the current fresh
+    # prediction. It no longer only flips the trading flag.
+    # The result contains the actual Deriv contract/P&L data.
+    try:
+
+        result = await execute_current_prediction(
+            session[
+                "session_id"
+            ]
+        )
+
+    except Exception:
+
+        # Do not leave the UI in a false "Trading" state when
+        # the first execution failed before a contract opened.
+        if not session.get(
+            "active_trade"
+        ):
+            session[
+                "trading"
+            ] = False
+
+        raise
+
+    selected_stats = session.get(
+        "demo_stats"
+        if account == "demo"
+        else "real_stats",
+        new_stats(),
+    )
+
+    trades_count = int(
+        selected_stats.get(
+            "trades",
+            0,
+        )
+    )
+
+    wins_count = int(
+        selected_stats.get(
+            "wins",
+            0,
+        )
+    )
+
     return {
         "status": "ok",
 
         "message": (
-            f"{account.capitalize()} trading started."
+            f"{account.capitalize()} trading started "
+            "and the first trade was executed."
         ),
 
-        "trading": True,
+        "trading": bool(
+            session.get(
+                "trading",
+                False,
+            )
+        ),
 
         "account": account,
+
+        "account_id": session[
+            "accounts"
+        ].get(
+            account
+        ),
 
         "stake": stake,
 
@@ -6283,6 +6461,51 @@ async def start_trading(
         "real_market_mode": session[
             "real_market_mode"
         ],
+
+        "result": result.get(
+            "result",
+            result,
+        ),
+
+        "prediction": result.get(
+            "prediction"
+        ),
+
+        "balance": session[
+            "balances"
+        ].get(
+            account
+        ),
+
+        "stats": {
+            "profit": round(
+                float(
+                    selected_stats.get(
+                        "profit",
+                        0.0,
+                    )
+                ),
+                2,
+            ),
+            "trades": trades_count,
+            "wins": wins_count,
+            "losses": int(
+                selected_stats.get(
+                    "losses",
+                    0,
+                )
+            ),
+            "win_rate": round(
+                wins_count / trades_count * 100
+                if trades_count
+                else 0.0,
+                2,
+            ),
+        },
+
+        "active_trade": session.get(
+            "active_trade"
+        ),
 
         "consecutive_losses": (
             get_consecutive_losses(
@@ -6312,9 +6535,44 @@ async def stop_trading(
         request.account
     )
 
+    # Only stop the account currently selected by this session.
+    # A stale Demo/Real UI request must not alter the other mode.
+    selected_account = normalize_account_type(
+        session.get(
+            "account",
+            "demo",
+        )
+    )
+
+    if account != selected_account:
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The session is currently using the "
+                f"{selected_account} account. "
+                f"{account.capitalize()} trading was not changed."
+            ),
+        )
+
     session[
         "trading"
     ] = False
+
+    active_trade = session.get(
+        "active_trade"
+    )
+
+    if (
+        active_trade
+        and normalize_account_type(
+            active_trade.get(
+                "account",
+                account,
+            )
+        ) != account
+    ):
+        active_trade = None
 
     return {
         "status": "ok",
@@ -6323,9 +6581,7 @@ async def stop_trading(
 
         "account": account,
 
-        "active_trade": session.get(
-            "active_trade"
-        ),
+        "active_trade": active_trade,
 
         "message": (
             f"{account.capitalize()} trading stopped. "
@@ -6767,6 +7023,27 @@ async def execute_current_prediction(
             DEFAULT_BARRIER,
         )
 
+    selected_stats = session.get(
+        "demo_stats"
+        if account == "demo"
+        else "real_stats",
+        new_stats(),
+    )
+
+    trades_count = int(
+        selected_stats.get(
+            "trades",
+            0,
+        )
+    )
+
+    wins_count = int(
+        selected_stats.get(
+            "wins",
+            0,
+        )
+    )
+
     return {
         "status": "ok",
 
@@ -6780,6 +7057,38 @@ async def execute_current_prediction(
         "prediction": prediction,
 
         "result": result,
+
+        "balance": session[
+            "balances"
+        ].get(
+            account
+        ),
+
+        "stats": {
+            "profit": round(
+                float(
+                    selected_stats.get(
+                        "profit",
+                        0.0,
+                    )
+                ),
+                2,
+            ),
+            "trades": trades_count,
+            "wins": wins_count,
+            "losses": int(
+                selected_stats.get(
+                    "losses",
+                    0,
+                )
+            ),
+            "win_rate": round(
+                wins_count / trades_count * 100
+                if trades_count
+                else 0.0,
+                2,
+            ),
+        },
     }
 
 
