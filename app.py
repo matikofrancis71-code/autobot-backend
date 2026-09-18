@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip().rstrip("/")
 DERIV_CLIENT_ID = os.getenv("DERIV_CLIENT_ID", "").strip()
@@ -194,6 +194,7 @@ def new_session(session_id: Optional[str] = None) -> Dict[str, Any]:
         "refresh_token": None,
         "token_expires_at": None,
         "accounts": {"demo": None, "real": None},
+        "account_debug": [],
         "account_currencies": {"demo": "USD", "real": "USD"},
         "balances": {"demo": None, "real": None},
         "demo_stats": new_stats(),
@@ -311,6 +312,9 @@ def extract_account_id(account: Dict[str, Any]) -> Optional[str]:
 
 
 def detect_account_type(account: Dict[str, Any]) -> Optional[str]:
+    flagged = _account_type_from_flags(account)
+    if flagged:
+        return flagged
     values = [
         account.get("account_type"),
         account.get("accountType"),
@@ -318,6 +322,9 @@ def detect_account_type(account: Dict[str, Any]) -> Optional[str]:
         account.get("environment"),
         account.get("mode"),
         account.get("loginid"),
+        account.get("login_id"),
+        account.get("account_name"),
+        account.get("name"),
     ]
     text = " ".join(str(v).lower() for v in values if v is not None)
     if any(x in text for x in ("demo", "virtual", "practice")):
@@ -335,19 +342,45 @@ def detect_currency(account: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_accounts(response: Dict[str, Any]) -> List[Dict[str, Any]]:
-    raw = response.get("data")
-    if raw is None:
-        raw = response.get("accounts")
-    if raw is None:
-        raw = []
-    if isinstance(raw, dict):
-        # Some responses may contain one account object directly.
-        if extract_account_id(raw):
-            return [raw]
-        return [v for v in raw.values() if isinstance(v, dict)]
-    if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, dict)]
-    return []
+    """Extract account objects from several documented/observed response shapes."""
+    found: List[Dict[str, Any]] = []
+    seen = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            account_id = extract_account_id(value)
+            # Treat a dict as an account when it has an ID plus account-ish fields.
+            if account_id and any(
+                key in value
+                for key in (
+                    "account_type", "accountType", "type", "environment",
+                    "mode", "currency", "currency_code", "loginid", "login_id",
+                    "is_demo", "is_virtual", "is_real",
+                )
+            ):
+                marker = account_id
+                if marker not in seen:
+                    seen.add(marker)
+                    found.append(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(response)
+    return found
+
+
+def _account_type_from_flags(account: Dict[str, Any]) -> Optional[str]:
+    for key in ("is_demo", "is_virtual"):
+        value = account.get(key)
+        if value in {True, 1, "1", "true", "True"}:
+            return "demo"
+    value = account.get("is_real")
+    if value in {True, 1, "1", "true", "True"}:
+        return "real"
+    return None
 
 
 async def load_options_accounts(session: Dict[str, Any]) -> None:
@@ -356,22 +389,32 @@ async def load_options_accounts(session: Dict[str, Any]) -> None:
 
     demo_account = None
     real_account = None
+    debug = []
     for account in raw_accounts:
         account_id = extract_account_id(account)
         if not account_id:
             continue
         account_type = detect_account_type(account)
-        currency = detect_currency(account)
+        currency = detect_currency(account) or "USD"
+        debug.append({
+            "account_id": account_id,
+            "type": account_type,
+            "currency": currency,
+        })
         if account_type == "demo" and not demo_account:
             demo_account = account_id
-            if currency:
-                session["account_currencies"]["demo"] = currency
+            session["account_currencies"]["demo"] = currency
         elif account_type == "real" and not real_account:
             real_account = account_id
-            if currency:
-                session["account_currencies"]["real"] = currency
+            session["account_currencies"]["real"] = currency
 
     session["accounts"] = {"demo": demo_account, "real": real_account}
+    session["account_debug"] = debug
+
+    # Do not silently claim the account is connected if Options accounts were
+    # not actually returned. This makes the frontend state truthful.
+    if not demo_account and not real_account:
+        raise RuntimeError("OAuth succeeded, but no Deriv Options trading accounts were returned.")
 
 # ============================================================
 # WEBSOCKET HELPERS
@@ -1460,6 +1503,7 @@ async def session_status(session_id: str):
             "demo": bool(session["accounts"].get("demo")),
             "real": bool(session["accounts"].get("real")),
         },
+        "balances": session["balances"],
         "trading": session["trading"],
         "real_trading_enabled": REAL_TRADING_ENABLED,
         "active_trade": session["active_trade"],
@@ -1582,26 +1626,80 @@ async def deriv_callback(code: Optional[str] = None, state: Optional[str] = None
 # ACCOUNT / MARKETS / PREDICTION
 # ============================================================
 
+@app.get("/api/account/diagnostics/{session_id}")
+async def account_diagnostics(session_id: str):
+    session = get_session(session_id)
+    return {
+        "status": "ok",
+        "connected": session["connected"],
+        "connection_status": session["connection_status"],
+        "accounts": session["accounts"],
+        "currencies": session["account_currencies"],
+        "balances": session["balances"],
+        "account_debug": session.get("account_debug", []),
+    }
+
 @app.get("/api/account/balance/{session_id}")
 async def account_balance(session_id: str):
     session = get_session(session_id)
+    errors = {}
     if session["connected"]:
-        await refresh_all_balances(session)
+        for account_type in ("demo", "real"):
+            if not session["accounts"].get(account_type):
+                continue
+            try:
+                await refresh_account_balance(session, account_type)
+            except Exception as exc:
+                errors[account_type] = str(exc)
     return {
         "status": "ok",
+        "connected": session["connected"],
+        "accounts": session["accounts"],
         "balances": {"demo": session["balances"].get("demo"), "real": session["balances"].get("real")},
         "currencies": session["account_currencies"],
+        "errors": errors,
     }
 
 
 @app.get("/api/markets")
-async def markets():
-    result = await analyze_live_markets(DEFAULT_BARRIER, force_fresh=False)
+async def markets(force_refresh: bool = False):
+    """Return currently eligible Deriv Options markets independently of prediction."""
+    try:
+        eligible = await get_tradeable_symbols(force_refresh=force_refresh)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "markets": [],
+            "count": 0,
+            "generated_at": iso_now(),
+            "error": str(exc),
+        }
+
+    # Add one current quote per market without opening concurrent sockets.
+    output = []
+    try:
+        async with public_ws_connection() as ws:
+            for item in eligible:
+                symbol = item["symbol"]
+                latest = None
+                try:
+                    tick_response = await ws_request_existing(
+                        ws, {"ticks": symbol}, expected_msg_types={"tick"}, timeout=8
+                    )
+                    tick = tick_response.get("tick")
+                    if isinstance(tick, dict):
+                        latest = safe_float(tick.get("quote"))
+                except Exception:
+                    pass
+                output.append({**item, "asset": symbol, "latest_price": latest, "tradeable": True})
+    except Exception:
+        output = [{**item, "asset": item["symbol"], "latest_price": None, "tradeable": True} for item in eligible]
+
     return {
         "status": "ok",
-        "markets": result.get("markets", []),
-        "count": len(result.get("markets", [])),
-        "generated_at": result.get("generated_at"),
+        "markets": output,
+        "count": len(output),
+        "generated_at": iso_now(),
     }
 
 
