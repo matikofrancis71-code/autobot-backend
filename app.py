@@ -25,7 +25,7 @@ import statistics
 import time
 import urllib.parse
 
-from asynccontextmanager import asynccontextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
