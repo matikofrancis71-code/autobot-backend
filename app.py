@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "7.2.0"
+APP_VERSION = "7.3.0"
 
 FRONTEND_ORIGIN = os.getenv(
     "FRONTEND_ORIGIN",
@@ -43,9 +43,11 @@ DERIV_REDIRECT_URI = os.getenv(
 
 DERIV_REST_BASE = "https://api.derivws.com"
 DERIV_AUTH_BASE = "https://auth.deriv.com"
+
 DERIV_PUBLIC_WS = (
     "wss://api.derivws.com/trading/v1/options/ws/public"
 )
+
 DERIV_OAUTH_SCOPE = "trade"
 
 REAL_TRADING_ENABLED = os.getenv(
@@ -59,9 +61,9 @@ REAL_TRADING_ENABLED = os.getenv(
 }
 
 
-# ------------------------------------------------------------
+# ============================================================
 # MARKET ANALYSIS SETTINGS
-# ------------------------------------------------------------
+# ============================================================
 
 HISTORY_TICKS = max(
     200,
@@ -89,9 +91,8 @@ PREDICTION_HORIZON_TICKS = max(
     ),
 )
 
-# This is a DATA QUALITY requirement, not a profitability
-# threshold. We do not require a specific accuracy or confidence
-# percentage anymore.
+# Data-quality requirement only.
+# This is NOT a profitability threshold.
 MIN_BACKTEST_SAMPLES = max(
     50,
     min(
@@ -105,14 +106,6 @@ MIN_BACKTEST_SAMPLES = max(
     ),
 )
 
-# Selection is based on both historical walk-forward accuracy
-# and current confidence.
-#
-# Default:
-#   50% historical accuracy
-#   50% current confidence
-#
-# These are weights, NOT minimum thresholds.
 SELECTION_ACCURACY_WEIGHT = float(
     os.getenv(
         "SELECTION_ACCURACY_WEIGHT",
@@ -127,7 +120,6 @@ SELECTION_CONFIDENCE_WEIGHT = float(
     )
 )
 
-# Prevent accidental invalid weighting.
 SELECTION_ACCURACY_WEIGHT = max(
     0.0,
     SELECTION_ACCURACY_WEIGHT,
@@ -151,7 +143,6 @@ else:
     SELECTION_CONFIDENCE_WEIGHT /= weight_total
 
 
-# Number of currently available markets analyzed per scan.
 MAX_SYMBOLS_TO_ANALYZE = max(
     1,
     min(
@@ -316,10 +307,7 @@ def iso_now() -> str:
     return utc_now().isoformat()
 
 
-def clean_symbol(
-    value: Any,
-) -> str:
-
+def clean_symbol(value: Any) -> str:
     return (
         ""
         if value is None
@@ -333,7 +321,6 @@ def safe_float(
 ) -> Optional[float]:
 
     try:
-
         result = float(value)
 
         return (
@@ -346,7 +333,6 @@ def safe_float(
         TypeError,
         ValueError,
     ):
-
         return default
 
 
@@ -356,14 +342,12 @@ def safe_int(
 ) -> Optional[int]:
 
     try:
-
         return int(value)
 
     except (
         TypeError,
         ValueError,
     ):
-
         return default
 
 
@@ -376,6 +360,97 @@ def clamp(
     return max(
         low,
         min(high, value),
+    )
+
+
+# ============================================================
+# IMPORTANT:
+# NORMALIZE ALL API/DERIV ERROR OBJECTS TO STRINGS
+# ============================================================
+
+def readable_api_error(
+    value: Any,
+    fallback: str = "Unknown error.",
+) -> str:
+
+    if value is None:
+        return fallback
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+
+        message = (
+            value.get("message")
+            or value.get("detail")
+            or value.get("reason")
+            or value.get("error_description")
+            or value.get("description")
+        )
+
+        code = value.get("code")
+
+        if message:
+
+            if code:
+                return (
+                    f"{code}: {message}"
+                )
+
+            return str(message)
+
+        nested = value.get("error")
+
+        if nested is not None:
+
+            return readable_api_error(
+                nested,
+                fallback,
+            )
+
+        try:
+
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+            )
+
+        except Exception:
+
+            return fallback
+
+    if isinstance(
+        value,
+        (list, tuple),
+    ):
+
+        try:
+
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+            )
+
+        except Exception:
+
+            return fallback
+
+    try:
+        return str(value)
+
+    except Exception:
+        return fallback
+
+
+def error_response_message(
+    value: Any,
+    fallback: str = "Unknown error.",
+) -> str:
+
+    return readable_api_error(
+        value,
+        fallback,
     )
 
 
@@ -416,7 +491,10 @@ def cleanup_memory() -> None:
 
     now = time.time()
 
-    # Clean OAuth states.
+    # --------------------------------------------------------
+    # OAuth states
+    # --------------------------------------------------------
+
     for state, item in list(
         OAUTH_STATES.items()
     ):
@@ -437,7 +515,10 @@ def cleanup_memory() -> None:
                 None,
             )
 
-    # Clean inactive sessions.
+    # --------------------------------------------------------
+    # Inactive sessions
+    # --------------------------------------------------------
+
     for sid, session in list(
         USER_SESSIONS.items()
     ):
@@ -468,7 +549,10 @@ def cleanup_memory() -> None:
                 None,
             )
 
-    # OAuth state hard limit.
+    # --------------------------------------------------------
+    # OAuth hard limit
+    # --------------------------------------------------------
+
     if len(OAUTH_STATES) > MAX_OAUTH_STATES:
 
         oldest = sorted(
@@ -490,7 +574,10 @@ def cleanup_memory() -> None:
                 None,
             )
 
-    # Session hard limit.
+    # --------------------------------------------------------
+    # Session hard limit
+    # --------------------------------------------------------
+
     if len(USER_SESSIONS) > MAX_SESSIONS:
 
         candidates = [
@@ -551,9 +638,7 @@ def new_session(
 
         "connected": False,
 
-        "connection_status": (
-            "disconnected"
-        ),
+        "connection_status": "disconnected",
 
         "access_token": None,
 
@@ -578,6 +663,7 @@ def new_session(
             "real": None,
         },
 
+        # Completely separate statistics.
         "demo_stats": new_stats(),
 
         "real_stats": new_stats(),
@@ -592,14 +678,13 @@ def new_session(
 
         "duration": DEFAULT_DURATION,
 
-        "duration_unit": (
-            DEFAULT_DURATION_UNIT
-        ),
+        "duration_unit": DEFAULT_DURATION_UNIT,
 
         "real_market_mode": False,
 
         "trading": False,
 
+        # Kept for compatibility with the existing frontend.
         "session_profit": 0.0,
 
         "session_trades": 0,
@@ -608,6 +693,13 @@ def new_session(
 
         "session_losses": 0,
 
+        # Separate loss counters by account.
+        "consecutive_losses_by_account": {
+            "demo": 0,
+            "real": 0,
+        },
+
+        # Legacy/current-account value.
         "consecutive_losses": 0,
 
         "active_trade": None,
@@ -641,8 +733,8 @@ def get_session(
         session_id
     )
 
-    # Render restarts wipe RAM while
-    # browser can retain old ID.
+    # Render restarts wipe RAM while the
+    # browser may retain an old session ID.
     if session is None:
 
         session = new_session(
@@ -673,6 +765,91 @@ def ensure_session(
     return get_session(
         session_id
     )
+
+
+def get_consecutive_losses(
+    session: Dict[str, Any],
+    account_type: str,
+) -> int:
+
+    account_type = normalize_account_type(
+        account_type
+    )
+
+    counters = session.get(
+        "consecutive_losses_by_account"
+    )
+
+    if not isinstance(
+        counters,
+        dict,
+    ):
+
+        counters = {
+            "demo": 0,
+            "real": 0,
+        }
+
+        session[
+            "consecutive_losses_by_account"
+        ] = counters
+
+    value = safe_int(
+        counters.get(
+            account_type,
+            0,
+        ),
+        0,
+    )
+
+    return max(
+        0,
+        value or 0,
+    )
+
+
+def set_consecutive_losses(
+    session: Dict[str, Any],
+    account_type: str,
+    value: int,
+) -> None:
+
+    account_type = normalize_account_type(
+        account_type
+    )
+
+    if not isinstance(
+        session.get(
+            "consecutive_losses_by_account"
+        ),
+        dict,
+    ):
+
+        session[
+            "consecutive_losses_by_account"
+        ] = {
+            "demo": 0,
+            "real": 0,
+        }
+
+    value = max(
+        0,
+        int(value),
+    )
+
+    session[
+        "consecutive_losses_by_account"
+    ][account_type] = value
+
+    # Legacy compatibility field reflects the
+    # currently selected account.
+    if session.get(
+        "account"
+    ) == account_type:
+
+        session[
+            "consecutive_losses"
+        ] = value
 
 
 # ============================================================
@@ -784,11 +961,17 @@ async def deriv_rest_async(
 
     if response.status_code >= 400:
 
-        text = response.text[:1200]
+        try:
+            error_body = response.json()
+        except Exception:
+            error_body = response.text[:1200]
 
         raise HTTPException(
             status_code=response.status_code,
-            detail=text,
+            detail=readable_api_error(
+                error_body,
+                "Deriv REST request failed.",
+            ),
         )
 
     try:
@@ -847,7 +1030,6 @@ def extract_account_id(
         )
 
         if value:
-
             return str(value)
 
     return None
@@ -902,37 +1084,18 @@ def detect_account_type(
     )
 
     if flagged:
-
         return flagged
 
     values = [
-        account.get(
-            "account_type"
-        ),
-        account.get(
-            "accountType"
-        ),
-        account.get(
-            "type"
-        ),
-        account.get(
-            "environment"
-        ),
-        account.get(
-            "mode"
-        ),
-        account.get(
-            "loginid"
-        ),
-        account.get(
-            "login_id"
-        ),
-        account.get(
-            "account_name"
-        ),
-        account.get(
-            "name"
-        ),
+        account.get("account_type"),
+        account.get("accountType"),
+        account.get("type"),
+        account.get("environment"),
+        account.get("mode"),
+        account.get("loginid"),
+        account.get("login_id"),
+        account.get("account_name"),
+        account.get("name"),
     ]
 
     text = " ".join(
@@ -975,7 +1138,6 @@ def detect_currency(
     ):
 
         if account.get(key):
-
             return str(
                 account[key]
             )
@@ -1042,7 +1204,6 @@ def _extract_accounts(
                     )
 
             for child in value.values():
-
                 walk(child)
 
         elif isinstance(
@@ -1051,7 +1212,6 @@ def _extract_accounts(
         ):
 
             for child in value:
-
                 walk(child)
 
     walk(response)
@@ -1087,7 +1247,6 @@ async def load_options_accounts(
         )
 
         if not account_id:
-
             continue
 
         account_type = (
@@ -1116,9 +1275,7 @@ async def load_options_accounts(
             and not demo_account
         ):
 
-            demo_account = (
-                account_id
-            )
+            demo_account = account_id
 
             session[
                 "account_currencies"
@@ -1131,9 +1288,7 @@ async def load_options_accounts(
             and not real_account
         ):
 
-            real_account = (
-                account_id
-            )
+            real_account = account_id
 
             session[
                 "account_currencies"
@@ -1222,13 +1377,10 @@ async def ws_request(
                 )
 
                 try:
-
                     response = json.loads(
                         raw
                     )
-
                 except Exception:
-
                     continue
 
                 if isinstance(
@@ -1239,7 +1391,6 @@ async def ws_request(
                     if response.get(
                         "error"
                     ):
-
                         return response
 
                     if (
@@ -1249,7 +1400,6 @@ async def ws_request(
                         or "echo_req"
                         in response
                     ):
-
                         return response
 
     except asyncio.TimeoutError:
@@ -1260,7 +1410,6 @@ async def ws_request(
         )
 
     except TimeoutError:
-
         raise
 
     except Exception as exc:
@@ -1345,26 +1494,21 @@ async def ws_request_existing(
         )
 
         try:
-
             response = json.loads(
                 raw
             )
-
         except Exception:
-
             continue
 
         if not isinstance(
             response,
             dict,
         ):
-
             continue
 
         if response.get(
             "error"
         ):
-
             return response
 
         msg_type = response.get(
@@ -1437,9 +1581,7 @@ async def get_deriv_otp(
             "websocket_url",
         ):
 
-            if data.get(
-                key
-            ):
+            if data.get(key):
 
                 return str(
                     data[key]
@@ -1451,9 +1593,7 @@ async def get_deriv_otp(
         "websocket_url",
     ):
 
-        if response.get(
-            key
-        ):
+        if response.get(key):
 
             return str(
                 response[key]
@@ -1617,26 +1757,21 @@ async def send_and_receive(
         )
 
         try:
-
             response = json.loads(
                 raw
             )
-
         except Exception:
-
             continue
 
         if not isinstance(
             response,
             dict,
         ):
-
             continue
 
         if response.get(
             "error"
         ):
-
             return response
 
         if (
@@ -1685,8 +1820,9 @@ async def get_account_balance(
     ):
 
         raise RuntimeError(
-            str(
-                response["error"]
+            readable_api_error(
+                response["error"],
+                "Unable to retrieve account balance.",
             )
         )
 
@@ -1742,7 +1878,7 @@ async def refresh_all_balances(
 
         print(
             "[BALANCE] demo refresh failed: "
-            f"{exc}"
+            f"{readable_api_error(exc)}"
         )
 
     if session[
@@ -1762,7 +1898,7 @@ async def refresh_all_balances(
 
             print(
                 "[BALANCE] real refresh failed: "
-                f"{exc}"
+                f"{readable_api_error(exc)}"
             )
 
 
@@ -1794,7 +1930,6 @@ def normalize_active_symbol(
     )
 
     if not symbol:
-
         return None
 
     display_name = (
@@ -1983,8 +2118,9 @@ async def get_active_symbols_on_ws(
     ):
 
         raise RuntimeError(
-            str(
-                response["error"]
+            readable_api_error(
+                response["error"],
+                "Unable to retrieve active symbols.",
             )
         )
 
@@ -2011,7 +2147,6 @@ async def get_active_symbols_on_ws(
         )
 
         if normalized:
-
             result.append(
                 normalized
             )
@@ -2031,7 +2166,6 @@ async def verify_digit_contract_support_on_ws(
     )
 
     if not code:
-
         return False
 
     try:
@@ -2049,13 +2183,11 @@ async def verify_digit_contract_support_on_ws(
         )
 
     except Exception:
-
         return False
 
     if response.get(
         "error"
     ):
-
         return False
 
     data = response.get(
@@ -2067,7 +2199,6 @@ async def verify_digit_contract_support_on_ws(
         data,
         dict,
     ):
-
         return False
 
     available = data.get(
@@ -2079,7 +2210,6 @@ async def verify_digit_contract_support_on_ws(
         available,
         list,
     ):
-
         return False
 
     return any(
@@ -2273,8 +2403,9 @@ async def get_tick_history_on_ws(
     ):
 
         raise RuntimeError(
-            str(
-                response["error"]
+            readable_api_error(
+                response["error"],
+                "Unable to retrieve tick history.",
             )
         )
 
@@ -2402,7 +2533,6 @@ async def get_latest_tick_on_ws(
         if response.get(
             "error"
         ):
-
             return None
 
         tick = response.get(
@@ -2413,7 +2543,6 @@ async def get_latest_tick_on_ws(
             tick,
             dict,
         ):
-
             return None
 
         price = safe_float(
@@ -2426,7 +2555,6 @@ async def get_latest_tick_on_ws(
             price is None
             or price <= 0
         ):
-
             return None
 
         return price
@@ -2457,7 +2585,6 @@ async def get_latest_tick(
             tick,
             dict,
         ):
-
             return None
 
         price = safe_float(
@@ -2470,7 +2597,6 @@ async def get_latest_tick(
             price is None
             or price <= 0
         ):
-
             return None
 
         return price
@@ -2551,7 +2677,6 @@ def digit_distribution(
     for d in digits:
 
         if d in counts:
-
             counts[d] += 1
 
     total = len(digits)
@@ -2660,17 +2785,6 @@ def predict_digit_direction(
         - baseline
     )
 
-    # IMPORTANT CHANGE:
-    #
-    # We no longer convert the direction to NO TRADE merely
-    # because the current probability is below the theoretical
-    # baseline.
-    #
-    # The market-selection engine will compare the available
-    # markets and select the strongest valid candidate.
-    #
-    # Data-quality requirements are still enforced elsewhere.
-
     return (
         direction,
         round(
@@ -2704,7 +2818,6 @@ def calculate_ema(
 ) -> Optional[float]:
 
     if len(values) < period:
-
         return None
 
     multiplier = (
@@ -2737,11 +2850,9 @@ def calculate_rsi(
 ) -> Optional[float]:
 
     if len(values) <= period:
-
         return None
 
     gains = []
-
     losses = []
 
     for i in range(
@@ -2777,7 +2888,6 @@ def calculate_rsi(
     )
 
     if avg_loss == 0:
-
         return 100.0
 
     rs = (
@@ -2881,7 +2991,6 @@ def evaluate_digit_strategy(
         )
 
         if direction == "NO TRADE":
-
             continue
 
         actual = digits[
@@ -2897,7 +3006,6 @@ def evaluate_digit_strategy(
         samples += 1
 
         if success:
-
             correct += 1
 
     accuracy = (
@@ -3081,7 +3189,7 @@ async def analyze_symbol(
             "latest_price": None,
             "reason": (
                 "Tick history unavailable: "
-                f"{exc}"
+                f"{readable_api_error(exc)}"
             ),
         }
 
@@ -3111,11 +3219,7 @@ async def analyze_symbol(
     # --------------------------------------------------------
     # FRESH LIVE PRICE
     # --------------------------------------------------------
-    #
-    # History is already requested with end=latest, but we also
-    # request the current tick separately so the selected market
-    # cannot accidentally carry a zero/stale UI price.
-    #
+
     latest_price = None
 
     if ws is not None:
@@ -3200,22 +3304,10 @@ async def analyze_symbol(
             technical_bias = "DOWN"
 
     # --------------------------------------------------------
-    # NEW TRADING LOGIC
-    # --------------------------------------------------------
+    # DATA QUALITY
     #
-    # There is NO fixed:
-    #
-    #   58% accuracy requirement
-    #   62% confidence requirement
-    #
-    # Instead, the market must pass DATA QUALITY checks:
-    #
-    #   1. Valid OVER/UNDER direction
-    #   2. Enough walk-forward samples
-    #   3. Valid positive live price
-    #
-    # Then the market competes against other valid markets.
-    # The strongest candidate is selected later.
+    # No fixed 58% accuracy threshold.
+    # No fixed 62% confidence threshold.
     # --------------------------------------------------------
 
     data_quality_valid = bool(
@@ -3440,7 +3532,7 @@ async def analyze_live_markets(
                     "latest_price": None,
                     "reason": (
                         "Market discovery unavailable: "
-                        f"{exc}"
+                        f"{readable_api_error(exc)}"
                     ),
                 },
 
@@ -3549,7 +3641,7 @@ async def analyze_live_markets(
                     "reason": (
                         "Tick history connection "
                         "unavailable: "
-                        f"{exc}"
+                        f"{readable_api_error(exc)}"
                     ),
                 }
 
@@ -3558,19 +3650,6 @@ async def analyze_live_markets(
 
         # ----------------------------------------------------
         # RANKING
-        # ----------------------------------------------------
-        #
-        # Highest selection score wins.
-        #
-        # Score =
-        #
-        #   historical accuracy * 50%
-        #   +
-        #   current confidence * 50%
-        #
-        # No 58% / 62% minimum gate exists.
-        #
-        # Data quality still has to pass.
         # ----------------------------------------------------
 
         valid_candidates = [
@@ -3658,7 +3737,6 @@ async def analyze_live_markets(
                 "confidence."
             )
 
-            # Rank every valid market.
             for rank, market in enumerate(
                 valid_candidates,
                 start=1,
@@ -3681,12 +3759,14 @@ async def analyze_live_markets(
                         "below the selected market."
                     )
 
-        # Markets which failed data quality get no rank.
         for market in cleaned:
 
-            if not market.get(
-                "selected"
-            ) and "rank" not in market:
+            if (
+                not market.get(
+                    "selected"
+                )
+                and "rank" not in market
+            ):
 
                 market[
                     "rank"
@@ -3835,7 +3915,7 @@ async def analyze_live_markets(
 
 
 # ============================================================
-# TRADING
+# TRADING VALIDATION
 # ============================================================
 
 def validate_stake(
@@ -3965,6 +4045,10 @@ def validate_barrier_for_direction(
     )
 
 
+# ============================================================
+# PROPOSAL
+# ============================================================
+
 async def request_proposal(
     session: Dict[str, Any],
     account_type: str,
@@ -4045,8 +4129,9 @@ async def request_proposal(
 
         raise HTTPException(
             status_code=400,
-            detail=str(
-                response["error"]
+            detail=readable_api_error(
+                response["error"],
+                "Deriv proposal request failed.",
             ),
         )
 
@@ -4100,6 +4185,10 @@ async def buy_proposal(
     price: float,
 ) -> Dict[str, Any]:
 
+    account_type = normalize_account_type(
+        account_type
+    )
+
     if (
         account_type == "real"
         and not REAL_TRADING_ENABLED
@@ -4129,8 +4218,9 @@ async def buy_proposal(
 
         raise HTTPException(
             status_code=400,
-            detail=str(
-                response["error"]
+            detail=readable_api_error(
+                response["error"],
+                "Deriv buy request failed.",
             ),
         )
 
@@ -4200,8 +4290,9 @@ async def get_open_contract(
 
         raise HTTPException(
             status_code=400,
-            detail=str(
-                response["error"]
+            detail=readable_api_error(
+                response["error"],
+                "Unable to retrieve open contract.",
             ),
         )
 
@@ -4270,11 +4361,14 @@ def final_profit_from_contract(
         )
 
         if value is not None:
-
             return value
 
     return None
 
+
+# ============================================================
+# TRADE RESULT RECORDING
+# ============================================================
 
 def record_trade_result(
     session: Dict[str, Any],
@@ -4283,17 +4377,19 @@ def record_trade_result(
     profit: float,
 ) -> None:
 
+    account_type = normalize_account_type(
+        account_type
+    )
+
     stats_key = (
         "demo_stats"
-        if account_type
-        == "demo"
+        if account_type == "demo"
         else "real_stats"
     )
 
     history_key = (
         "demo_history"
-        if account_type
-        == "demo"
+        if account_type == "demo"
         else "real_history"
     )
 
@@ -4309,15 +4405,24 @@ def record_trade_result(
         "profit"
     ] += profit
 
+    current_losses = (
+        get_consecutive_losses(
+            session,
+            account_type,
+        )
+    )
+
     if profit > 0:
 
         stats[
             "wins"
         ] += 1
 
-        session[
-            "consecutive_losses"
-        ] = 0
+        set_consecutive_losses(
+            session,
+            account_type,
+            0,
+        )
 
     elif profit < 0:
 
@@ -4325,12 +4430,16 @@ def record_trade_result(
             "losses"
         ] += 1
 
-        session[
-            "consecutive_losses"
-        ] += 1
+        set_consecutive_losses(
+            session,
+            account_type,
+            current_losses + 1,
+        )
 
     history_item = {
         **trade,
+
+        "account": account_type,
 
         "profit": round(
             profit,
@@ -4361,30 +4470,47 @@ def record_trade_result(
         MAX_HISTORY_RECORDS:
     ]
 
-    session[
-        "session_profit"
-    ] = stats[
-        "profit"
-    ]
+    # Keep compatibility fields synchronized with
+    # the currently selected account.
+    if session.get(
+        "account"
+    ) == account_type:
 
-    session[
-        "session_trades"
-    ] = stats[
-        "trades"
-    ]
+        session[
+            "session_profit"
+        ] = stats[
+            "profit"
+        ]
 
-    session[
-        "session_wins"
-    ] = stats[
-        "wins"
-    ]
+        session[
+            "session_trades"
+        ] = stats[
+            "trades"
+        ]
 
-    session[
-        "session_losses"
-    ] = stats[
-        "losses"
-    ]
+        session[
+            "session_wins"
+        ] = stats[
+            "wins"
+        ]
 
+        session[
+            "session_losses"
+        ] = stats[
+            "losses"
+        ]
+
+        session[
+            "consecutive_losses"
+        ] = get_consecutive_losses(
+            session,
+            account_type,
+        )
+
+
+# ============================================================
+# BUY + MONITOR
+# ============================================================
 
 async def buy_and_monitor(
     session: Dict[str, Any],
@@ -4414,8 +4540,9 @@ async def buy_and_monitor(
 
             raise HTTPException(
                 status_code=400,
-                detail=str(
-                    bought["error"]
+                detail=readable_api_error(
+                    bought["error"],
+                    "Deriv buy request failed.",
                 ),
             )
 
@@ -4560,10 +4687,9 @@ async def buy_and_monitor(
                         "active_trade"
                     ][
                         "monitor_error"
-                    ] = str(
-                        response[
-                            "error"
-                        ]
+                    ] = readable_api_error(
+                        response["error"],
+                        "Contract monitoring error.",
                     )
 
                 continue
@@ -4615,6 +4741,11 @@ async def buy_and_monitor(
                         "status": (
                             "unknown_result"
                         ),
+                        "message": (
+                            "Contract finished but "
+                            "Deriv did not provide a "
+                            "final profit value."
+                        ),
                         "contract": contract,
                     }
 
@@ -4637,16 +4768,17 @@ async def buy_and_monitor(
                     )
 
                 except Exception:
-
                     pass
 
-                # Automatically stop after the configured
-                # consecutive-loss safety limit.
-                if (
-                    session.get(
-                        "consecutive_losses",
-                        0,
+                account_losses = (
+                    get_consecutive_losses(
+                        session,
+                        account_type,
                     )
+                )
+
+                if (
+                    account_losses
                     >= MAX_CONSECUTIVE_LOSSES
                 ):
 
@@ -4656,8 +4788,31 @@ async def buy_and_monitor(
 
                 return {
                     "status": "completed",
+
+                    "message": (
+                        f"{account_type.capitalize()} "
+                        "trade completed."
+                    ),
+
+                    "account": account_type,
+
                     "contract": contract,
-                    "profit": profit,
+
+                    "profit": round(
+                        profit,
+                        2,
+                    ),
+
+                    "consecutive_losses": (
+                        account_losses
+                    ),
+
+                    "trading": bool(
+                        session.get(
+                            "trading",
+                            False,
+                        )
+                    ),
                 }
 
         if session.get(
@@ -4676,10 +4831,23 @@ async def buy_and_monitor(
             "status": (
                 "monitoring_timeout"
             ),
+
+            "message": (
+                "Contract monitoring timed out. "
+                "The contract may still be open on Deriv."
+            ),
+
+            "account": account_type,
+
             "contract": last_contract,
+
             "contract_id": contract_id,
         }
 
+
+# ============================================================
+# EXECUTE TRADE
+# ============================================================
 
 async def execute_trade(
     session: Dict[str, Any],
@@ -4690,6 +4858,10 @@ async def execute_trade(
     duration: int,
     barrier: int,
 ) -> Dict[str, Any]:
+
+    account_type = normalize_account_type(
+        account_type
+    )
 
     if session.get(
         "active_trade"
@@ -4703,18 +4875,23 @@ async def execute_trade(
             ),
         )
 
-    if (
-        session.get(
-            "consecutive_losses",
-            0,
+    account_losses = (
+        get_consecutive_losses(
+            session,
+            account_type,
         )
+    )
+
+    if (
+        account_losses
         >= MAX_CONSECUTIVE_LOSSES
     ):
 
         raise HTTPException(
             status_code=403,
             detail=(
-                "Trading session is protected "
+                f"{account_type.capitalize()} "
+                "trading session is protected "
                 f"after {MAX_CONSECUTIVE_LOSSES} "
                 "consecutive losses."
             ),
@@ -4736,6 +4913,9 @@ async def execute_trade(
 
         return {
             "status": "no_trade",
+
+            "account": account_type,
+
             "message": (
                 "Prediction returned "
                 "NO TRADE."
@@ -4761,6 +4941,24 @@ async def execute_trade(
             barrier,
         )
     )
+
+    # --------------------------------------------------------
+    # ACCOUNT SAFETY
+    # --------------------------------------------------------
+
+    if not session[
+        "accounts"
+    ].get(
+        account_type
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No {account_type} Options "
+                "account is available."
+            ),
+        )
 
     if account_type == "real":
 
@@ -4801,7 +4999,7 @@ async def execute_trade(
             status_code=400,
             detail=(
                 "Stake exceeds available "
-                "balance."
+                f"{account_type} balance."
             ),
         )
 
@@ -4950,14 +5148,19 @@ async def root():
 
     return {
         "status": "ok",
+
         "app": "Fixed Risk Booster",
+
         "version": APP_VERSION,
+
         "real_trading_enabled": (
             REAL_TRADING_ENABLED
         ),
+
         "selection_mode": (
             "best_available_market"
         ),
+
         "selection_weights": {
             "historical_accuracy": (
                 SELECTION_ACCURACY_WEIGHT
@@ -4966,7 +5169,9 @@ async def root():
                 SELECTION_CONFIDENCE_WEIGHT
             ),
         },
+
         "accuracy_threshold": None,
+
         "confidence_threshold": None,
     }
 
@@ -5002,6 +5207,7 @@ async def create_session():
 
     return {
         "status": "ok",
+
         "session_id": session[
             "session_id"
         ],
@@ -5009,7 +5215,7 @@ async def create_session():
 
 
 # ============================================================
-# IMPORTANT COMPATIBILITY ROUTE
+# COMPATIBILITY SESSION REGISTER
 # ============================================================
 
 @app.post(
@@ -5035,7 +5241,6 @@ async def register_session(
             )
 
     except Exception:
-
         pass
 
     if session_id is not None:
@@ -5045,7 +5250,6 @@ async def register_session(
         ).strip()
 
         if not session_id:
-
             session_id = None
 
     session = new_session(
@@ -5054,6 +5258,7 @@ async def register_session(
 
     return {
         "status": "ok",
+
         "session_id": session[
             "session_id"
         ],
@@ -5071,6 +5276,13 @@ async def session_status(
         session_id
     )
 
+    current_account = normalize_account_type(
+        session.get(
+            "account",
+            "demo",
+        )
+    )
+
     return {
         "status": "ok",
 
@@ -5086,9 +5298,7 @@ async def session_status(
             "connection_status"
         ],
 
-        "account": session[
-            "account"
-        ],
+        "account": current_account,
 
         "accounts": {
             "demo": bool(
@@ -5123,6 +5333,23 @@ async def session_status(
         "active_trade": session[
             "active_trade"
         ],
+
+        "consecutive_losses": (
+            get_consecutive_losses(
+                session,
+                current_account,
+            )
+        ),
+
+        "consecutive_losses_by_account": (
+            session.get(
+                "consecutive_losses_by_account",
+                {
+                    "demo": 0,
+                    "real": 0,
+                },
+            )
+        ),
     }
 
 
@@ -5244,7 +5471,9 @@ async def deriv_callback(
             status_code=400,
             content={
                 "status": "error",
-                "error": error,
+                "error": str(error),
+                "detail": str(error),
+                "message": str(error),
             },
         )
 
@@ -5342,15 +5571,21 @@ async def deriv_callback(
             status_code=502,
             detail=(
                 "Deriv OAuth token exchange "
-                f"failed: {exc}"
+                f"failed: {readable_api_error(exc)}"
             ),
         )
 
     if response.status_code >= 400:
 
-        error_text = response.text[
-            :1000
-        ]
+        try:
+            error_body = response.json()
+        except Exception:
+            error_body = response.text[:1000]
+
+        error_text = readable_api_error(
+            error_body,
+            "Deriv OAuth token exchange failed.",
+        )
 
         if FRONTEND_ORIGIN:
 
@@ -5364,10 +5599,7 @@ async def deriv_callback(
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Deriv OAuth token exchange "
-                "failed."
-            ),
+            detail=error_text,
         )
 
     try:
@@ -5381,6 +5613,19 @@ async def deriv_callback(
             detail=(
                 "Deriv OAuth returned "
                 "invalid token JSON."
+            ),
+        )
+
+    if not isinstance(
+        token_data,
+        dict,
+    ):
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Deriv OAuth returned "
+                "an unexpected response."
             ),
         )
 
@@ -5453,7 +5698,7 @@ async def deriv_callback(
             "connection_status"
         ] = (
             "connected_but_account_load_failed: "
-            f"{exc}"
+            f"{readable_api_error(exc)}"
         )
 
         if FRONTEND_ORIGIN:
@@ -5462,7 +5707,7 @@ async def deriv_callback(
                 f"{FRONTEND_ORIGIN}"
                 f"?deriv=error"
                 f"&error="
-                f"{urllib.parse.quote(str(exc))}",
+                f"{urllib.parse.quote(readable_api_error(exc))}",
                 status_code=302,
             )
 
@@ -5484,6 +5729,10 @@ async def deriv_callback(
         "session_id": session[
             "session_id"
         ],
+
+        "message": (
+            "Deriv account connected successfully."
+        ),
     }
 
 
@@ -5529,6 +5778,10 @@ async def account_diagnostics(
             "account_debug",
             [],
         ),
+
+        "real_trading_enabled": (
+            REAL_TRADING_ENABLED
+        ),
     }
 
 
@@ -5559,7 +5812,6 @@ async def account_balance(
             ].get(
                 account_type
             ):
-
                 continue
 
             try:
@@ -5573,7 +5825,10 @@ async def account_balance(
 
                 errors[
                     account_type
-                ] = str(exc)
+                ] = readable_api_error(
+                    exc,
+                    f"Unable to refresh {account_type} balance.",
+                )
 
     return {
         "status": "ok",
@@ -5625,6 +5880,11 @@ async def markets(
 
     except Exception as exc:
 
+        message = readable_api_error(
+            exc,
+            "Market discovery failed.",
+        )
+
         return {
             "status": "error",
 
@@ -5634,7 +5894,9 @@ async def markets(
 
             "generated_at": iso_now(),
 
-            "error": str(exc),
+            "error": message,
+
+            "message": message,
         }
 
     output = []
@@ -5661,7 +5923,6 @@ async def markets(
                     )
 
                 except Exception:
-
                     pass
 
                 output.append(
@@ -5839,6 +6100,13 @@ async def trading_status(
         session_id
     )
 
+    account = normalize_account_type(
+        session.get(
+            "account",
+            "demo",
+        )
+    )
+
     return {
         "status": "ok",
 
@@ -5846,9 +6114,7 @@ async def trading_status(
             "trading"
         ],
 
-        "account": session[
-            "account"
-        ],
+        "account": account,
 
         "real_market_mode": session[
             "real_market_mode"
@@ -5858,9 +6124,22 @@ async def trading_status(
             "active_trade"
         ],
 
-        "consecutive_losses": session[
-            "consecutive_losses"
-        ],
+        "consecutive_losses": (
+            get_consecutive_losses(
+                session,
+                account,
+            )
+        ),
+
+        "consecutive_losses_by_account": (
+            session.get(
+                "consecutive_losses_by_account",
+                {
+                    "demo": 0,
+                    "real": 0,
+                },
+            )
+        ),
 
         "max_consecutive_losses": (
             MAX_CONSECUTIVE_LOSSES
@@ -5869,7 +6148,7 @@ async def trading_status(
 
 
 # ============================================================
-# START / STOP
+# START TRADING
 # ============================================================
 
 @app.post(
@@ -5914,7 +6193,9 @@ async def start_trading(
                 status_code=403,
                 detail=(
                     "Real trading is disabled "
-                    "on the backend."
+                    "on the backend. Set "
+                    "REAL_TRADING_ENABLED=true "
+                    "on Render to enable it."
                 ),
             )
 
@@ -5932,20 +6213,24 @@ async def start_trading(
                 ),
             )
 
-    elif not session[
-        "accounts"
-    ].get(
-        "demo"
-    ):
+    else:
 
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No demo Options account "
-                "is available."
-            ),
-        )
+        if not session[
+            "accounts"
+        ].get(
+            "demo"
+        ):
 
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No demo Options account "
+                    "is available."
+                ),
+            )
+
+    # Switching account resets only the currently
+    # selected account's trading configuration.
     session[
         "account"
     ] = account
@@ -5968,12 +6253,24 @@ async def start_trading(
         else False
     )
 
+    # Keep compatibility field synchronized.
+    session[
+        "consecutive_losses"
+    ] = get_consecutive_losses(
+        session,
+        account,
+    )
+
     session[
         "trading"
     ] = True
 
     return {
         "status": "ok",
+
+        "message": (
+            f"{account.capitalize()} trading started."
+        ),
 
         "trading": True,
 
@@ -5986,8 +6283,19 @@ async def start_trading(
         "real_market_mode": session[
             "real_market_mode"
         ],
+
+        "consecutive_losses": (
+            get_consecutive_losses(
+                session,
+                account,
+            )
+        ),
     }
 
+
+# ============================================================
+# STOP TRADING
+# ============================================================
 
 @app.post(
     "/api/trading/stop"
@@ -6000,6 +6308,10 @@ async def stop_trading(
         request.session_id
     )
 
+    account = normalize_account_type(
+        request.account
+    )
+
     session[
         "trading"
     ] = False
@@ -6009,12 +6321,15 @@ async def stop_trading(
 
         "trading": False,
 
+        "account": account,
+
         "active_trade": session.get(
             "active_trade"
         ),
 
         "message": (
-            "Future trades stopped. "
+            f"{account.capitalize()} trading stopped. "
+            "Future trades are stopped. "
             "Any already-open Deriv contract "
             "continues until it finishes."
         ),
@@ -6051,6 +6366,63 @@ async def manual_trade(
             ),
         )
 
+    # Real manual trading requires the same explicit
+    # safety gate as automatic Real trading.
+    if account == "real":
+
+        if not REAL_TRADING_ENABLED:
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real trading is disabled "
+                    "on the backend."
+                ),
+            )
+
+        if not session[
+            "accounts"
+        ].get(
+            "real"
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No real Options account "
+                    "is available."
+                ),
+            )
+
+        if not session.get(
+            "real_market_mode",
+            False,
+        ):
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Real market mode is not "
+                    "enabled for this session."
+                ),
+            )
+
+    else:
+
+        if not session[
+            "accounts"
+        ].get(
+            "demo"
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No demo Options account "
+                    "is available."
+                ),
+            )
+
     asset = clean_symbol(
         request.asset
     )
@@ -6072,6 +6444,8 @@ async def manual_trade(
 
         return {
             "status": "no_trade",
+
+            "account": account,
 
             "message": (
                 "NO TRADE signal."
@@ -6123,12 +6497,19 @@ async def manual_trade(
     return {
         "status": "ok",
 
+        "account": account,
+
+        "message": (
+            f"{account.capitalize()} "
+            "trade request completed."
+        ),
+
         "result": result,
     }
 
 
 # ============================================================
-# AUTO TRADE CURRENT BEST PREDICTION
+# AUTOMATIC CURRENT BEST PREDICTION
 # ============================================================
 
 @app.post(
@@ -6175,11 +6556,22 @@ async def execute_current_prediction(
             ),
         )
 
-    if (
+    account = normalize_account_type(
         session.get(
-            "consecutive_losses",
-            0,
+            "account",
+            "demo",
         )
+    )
+
+    account_losses = (
+        get_consecutive_losses(
+            session,
+            account,
+        )
+    )
+
+    if (
+        account_losses
         >= MAX_CONSECUTIVE_LOSSES
     ):
 
@@ -6190,16 +6582,13 @@ async def execute_current_prediction(
         raise HTTPException(
             status_code=403,
             detail=(
-                "Trading automatically stopped "
+                f"{account.capitalize()} "
+                "trading automatically stopped "
                 "after "
                 f"{MAX_CONSECUTIVE_LOSSES} "
                 "consecutive losses."
             ),
         )
-
-    account = session[
-        "account"
-    ]
 
     if account == "real":
 
@@ -6209,6 +6598,20 @@ async def execute_current_prediction(
                 status_code=403,
                 detail=(
                     "Real trading is disabled."
+                ),
+            )
+
+        if not session[
+            "accounts"
+        ].get(
+            "real"
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No real Options account "
+                    "is available."
                 ),
             )
 
@@ -6224,11 +6627,24 @@ async def execute_current_prediction(
                 ),
             )
 
+    else:
+
+        if not session[
+            "accounts"
+        ].get(
+            "demo"
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No demo Options account "
+                    "is available."
+                ),
+            )
+
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Always perform a fresh market analysis immediately before
-    # an automatic trade.
+    # ALWAYS FRESH ANALYSIS
     # --------------------------------------------------------
 
     prediction_result = (
@@ -6275,10 +6691,6 @@ async def execute_current_prediction(
 
     # --------------------------------------------------------
     # FINAL LIVE PRICE SAFETY CHECK
-    #
-    # The analyzer already checked the price. We verify it
-    # again immediately before execution so a 0/null price can
-    # never silently become an automatic trade.
     # --------------------------------------------------------
 
     if (
@@ -6289,6 +6701,8 @@ async def execute_current_prediction(
 
         return {
             "status": "no_trade",
+
+            "account": account,
 
             "prediction": prediction,
 
@@ -6311,6 +6725,8 @@ async def execute_current_prediction(
         return {
             "status": "no_trade",
 
+            "account": account,
+
             "prediction": prediction,
 
             "message": (
@@ -6318,10 +6734,6 @@ async def execute_current_prediction(
                 "was selected."
             ),
         }
-
-    # --------------------------------------------------------
-    # STAKE / DURATION
-    # --------------------------------------------------------
 
     amount = validate_stake(
         session.get(
@@ -6338,7 +6750,7 @@ async def execute_current_prediction(
     )
 
     # --------------------------------------------------------
-    # EXECUTE ONLY THE SELECTED BEST MARKET
+    # EXECUTE ONLY SELECTED MARKET
     # --------------------------------------------------------
 
     async with session[
@@ -6357,6 +6769,13 @@ async def execute_current_prediction(
 
     return {
         "status": "ok",
+
+        "account": account,
+
+        "message": (
+            f"{account.capitalize()} "
+            "automatic trade completed."
+        ),
 
         "prediction": prediction,
 
@@ -6426,6 +6845,10 @@ async def disconnect(
 
         "trading": False,
 
+        "message": (
+            "Deriv account disconnected."
+        ),
+
         "active_trade": session.get(
             "active_trade"
         ),
@@ -6446,7 +6869,7 @@ async def global_exception_handler(
         "[ERROR] "
         f"{request.method} "
         f"{request.url}: "
-        f"{exc}"
+        f"{readable_api_error(exc)}"
     )
 
     if isinstance(
@@ -6454,15 +6877,24 @@ async def global_exception_handler(
         HTTPException,
     ):
 
+        detail = readable_api_error(
+            exc.detail,
+            f"HTTP {exc.status_code} error.",
+        )
+
         return JSONResponse(
             status_code=exc.status_code,
 
             content={
                 "status": "error",
 
-                "detail": exc.detail,
+                "detail": detail,
+
+                "message": detail,
             },
         )
+
+    detail = "Internal server error."
 
     return JSONResponse(
         status_code=500,
@@ -6470,8 +6902,8 @@ async def global_exception_handler(
         content={
             "status": "error",
 
-            "detail": (
-                "Internal server error."
-            ),
+            "detail": detail,
+
+            "message": detail,
         },
     )
