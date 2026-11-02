@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "7.3.0"
+APP_VERSION = "7.4.0"
 
 FRONTEND_ORIGIN = os.getenv(
     "FRONTEND_ORIGIN",
@@ -65,15 +65,11 @@ REAL_TRADING_ENABLED = os.getenv(
 # MARKET ANALYSIS SETTINGS
 # ============================================================
 
+# User-selected analysis window: 100 newest chronological ticks by default.
 HISTORY_TICKS = max(
-    200,
+    100,
     min(
-        int(
-            os.getenv(
-                "HISTORY_TICKS",
-                "2000",
-            )
-        ),
+        int(os.getenv("HISTORY_TICKS", "100")),
         5000,
     ),
 )
@@ -679,6 +675,10 @@ def new_session(
         "duration": DEFAULT_DURATION,
 
         "duration_unit": DEFAULT_DURATION_UNIT,
+
+        # "all" includes every discovered volatility index.
+        # Other accepted values are normalized market groups (10, 25, 50, 75, 100, 10_1s, etc.).
+        "volatility_filter": "all",
 
         "real_market_mode": False,
 
@@ -2023,6 +2023,14 @@ def normalize_active_symbol(
             submarket
         ),
 
+        "volatility_group": classify_volatility_index({
+            "symbol": symbol,
+            "display_name": display_name,
+            "market": market,
+            "subgroup": subgroup,
+            "submarket": submarket,
+        }),
+
         "pip": safe_float(
             pip,
             0.0,
@@ -2038,6 +2046,44 @@ def normalize_active_symbol(
             False,
         ),
     }
+
+
+def classify_volatility_index(symbol: Dict[str, Any]) -> str:
+    """Return a stable filter key for common Deriv volatility indices."""
+    import re
+
+    code = clean_symbol(symbol.get("symbol")).upper()
+    label = " ".join(
+        str(symbol.get(key) or "")
+        for key in ("display_name", "market", "subgroup", "submarket")
+    ).lower()
+    searchable = f"{code} {label}"
+
+    # One-second indices have the 1HZ prefix (for example 1HZ50V).
+    match = re.search(r"1HZ(10|25|50|75|100)V?", code)
+    if match:
+        return f"{match.group(1)}_1s"
+
+    # Standard volatility indices use R_10/R_25/... or named labels.
+    match = re.search(r"(?:^|[^0-9])(10|25|50|75|100)(?:[^0-9]|$)", searchable)
+    if match and ("volatility" in searchable or code.startswith("R_") or "synthetic" in searchable):
+        return match.group(1)
+
+    if "jump" in searchable or code.startswith("JD"):
+        return "jump"
+    if "step" in searchable or code.startswith("STP"):
+        return "step"
+    if "range break" in searchable or code.startswith("RB"):
+        return "range_break"
+    return "other"
+
+
+def normalize_volatility_filter(value: Optional[str]) -> str:
+    selected = str(value or "all").strip().lower().replace(" ", "_")
+    allowed = {"all", "10", "25", "50", "75", "100", "10_1s", "25_1s", "50_1s", "75_1s", "100_1s", "jump", "step", "range_break", "other"}
+    if selected not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported volatility filter: {selected}")
+    return selected
 
 
 def symbol_is_trade_candidate(
@@ -3391,6 +3437,8 @@ async def analyze_symbol(
 
         "display_name": display_name,
 
+        "volatility_group": classify_volatility_index(symbol_data),
+
         "direction": direction,
 
         "confidence": round(
@@ -3463,6 +3511,7 @@ async def analyze_symbol(
 async def analyze_live_markets(
     barrier: int = DEFAULT_BARRIER,
     force_fresh: bool = True,
+    volatility_filter: str = "all",
 ) -> Dict[str, Any]:
 
     now = time.monotonic()
@@ -3509,6 +3558,8 @@ async def analyze_live_markets(
 
             return cached
 
+        selected_volatility = normalize_volatility_filter(volatility_filter)
+
         try:
 
             candidates = (
@@ -3538,6 +3589,8 @@ async def analyze_live_markets(
 
                 "markets": [],
 
+                "volatility_filter": selected_volatility,
+
                 "generated_at": iso_now(),
             }
 
@@ -3547,6 +3600,12 @@ async def analyze_live_markets(
             )
 
             return output
+
+        if selected_volatility != "all":
+            candidates = [
+                item for item in candidates
+                if classify_volatility_index(item) == selected_volatility
+            ]
 
         if not candidates:
 
@@ -3570,6 +3629,8 @@ async def analyze_live_markets(
                 },
 
                 "markets": [],
+
+                "volatility_filter": selected_volatility,
 
                 "generated_at": iso_now(),
             }
@@ -3902,6 +3963,8 @@ async def analyze_live_markets(
             "prediction": prediction,
 
             "markets": cleaned,
+
+            "volatility_filter": selected_volatility,
 
             "generated_at": iso_now(),
         }
@@ -4863,8 +4926,9 @@ async def execute_trade(
         account_type
     )
 
-    if session.get(
-        "active_trade"
+    if (
+        session.get("active_trade")
+        and session.get("active_trade", {}).get("account") == account_type
     ):
 
         raise HTTPException(
@@ -5092,6 +5156,8 @@ class TradingStartRequest(
     )
 
     real_market_mode: bool = False
+
+    volatility_filter: str = "all"
 
 
 class TradingStopRequest(
@@ -5330,9 +5396,30 @@ async def session_status(
             REAL_TRADING_ENABLED
         ),
 
-        "active_trade": session[
-            "active_trade"
-        ],
+        "active_trade": (
+            session.get("active_trade")
+            if (
+                session.get("active_trade") is None
+                or session.get("active_trade", {}).get("account") == account
+            )
+            else None
+        ),
+
+        "balance": session.get("balances", {}).get(account),
+
+        "stats": (
+            session.get("demo_stats", {})
+            if account == "demo"
+            else session.get("real_stats", {})
+        ),
+
+        "history": (
+            list(
+                session.get("demo_history", [])
+                if account == "demo"
+                else session.get("real_history", [])
+            )
+        ),
 
         "consecutive_losses": (
             get_consecutive_losses(
@@ -5966,20 +6053,50 @@ async def markets(
     }
 
 
+@app.get("/api/volatility/options")
+async def volatility_options():
+    """List discovered volatility groups available for the selector."""
+    try:
+        symbols = await get_tradeable_symbols()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=readable_api_error(exc))
+    groups = sorted({classify_volatility_index(item) for item in symbols})
+    labels = {
+        "10": "Volatility 10",
+        "25": "Volatility 25",
+        "50": "Volatility 50",
+        "75": "Volatility 75",
+        "100": "Volatility 100",
+        "10_1s": "Volatility 10 (1s)",
+        "25_1s": "Volatility 25 (1s)",
+        "50_1s": "Volatility 50 (1s)",
+        "75_1s": "Volatility 75 (1s)",
+        "100_1s": "Volatility 100 (1s)",
+        "jump": "Jump Indices",
+        "step": "Step Indices",
+        "range_break": "Range Break Indices",
+        "other": "Other synthetic indices",
+    }
+    return {
+        "status": "ok",
+        "options": [{"value": "all", "label": "All available volatility markets"}] + [
+            {"value": group, "label": labels.get(group, group)} for group in groups
+        ],
+        "count": len(groups),
+    }
+
+
 @app.get(
     "/api/market/prediction"
 )
 async def market_prediction(
-    barrier: int = Query(
-        DEFAULT_BARRIER,
-        ge=0,
-        le=9,
-    ),
+    barrier: int = Query(DEFAULT_BARRIER, ge=0, le=9),
+    volatility_filter: str = Query("all"),
 ):
-
     return await analyze_live_markets(
         barrier,
         force_fresh=True,
+        volatility_filter=volatility_filter,
     )
 
 
@@ -6107,60 +6224,6 @@ async def trading_status(
         )
     )
 
-    stats_key = (
-        "demo_stats"
-        if account == "demo"
-        else "real_stats"
-    )
-
-    history_key = (
-        "demo_history"
-        if account == "demo"
-        else "real_history"
-    )
-
-    selected_stats = session.get(
-        stats_key,
-        new_stats(),
-    )
-
-    selected_history = session.get(
-        history_key,
-        [],
-    )
-
-    # Only expose the active trade belonging to the currently
-    # selected account. This prevents a Demo contract from
-    # appearing while Real is selected, or vice versa.
-    active_trade = session.get(
-        "active_trade"
-    )
-
-    if (
-        active_trade
-        and normalize_account_type(
-            active_trade.get(
-                "account",
-                account,
-            )
-        ) != account
-    ):
-        active_trade = None
-
-    trades_count = int(
-        selected_stats.get(
-            "trades",
-            0,
-        )
-    )
-
-    wins_count = int(
-        selected_stats.get(
-            "wins",
-            0,
-        )
-    )
-
     return {
         "status": "ok",
 
@@ -6170,53 +6233,13 @@ async def trading_status(
 
         "account": account,
 
-        "account_id": session[
-            "accounts"
-        ].get(
-            account
-        ),
-
-        "balance": session[
-            "balances"
-        ].get(
-            account
-        ),
-
-        "stats": {
-            "profit": round(
-                float(
-                    selected_stats.get(
-                        "profit",
-                        0.0,
-                    )
-                ),
-                2,
-            ),
-            "trades": trades_count,
-            "wins": wins_count,
-            "losses": int(
-                selected_stats.get(
-                    "losses",
-                    0,
-                )
-            ),
-            "win_rate": round(
-                wins_count / trades_count * 100
-                if trades_count
-                else 0.0,
-                2,
-            ),
-        },
-
-        "history": list(
-            selected_history
-        ),
-
         "real_market_mode": session[
             "real_market_mode"
         ],
 
-        "active_trade": active_trade,
+        "active_trade": session[
+            "active_trade"
+        ],
 
         "consecutive_losses": (
             get_consecutive_losses(
@@ -6323,36 +6346,8 @@ async def start_trading(
                 ),
             )
 
-    # Never allow the selected account to change while a
-    # contract belonging to the other account is active.
-    # This keeps Demo and Real state completely isolated.
-    active_trade = session.get(
-        "active_trade"
-    )
-
-    if active_trade:
-
-        active_account = normalize_account_type(
-            active_trade.get(
-                "account",
-                session.get(
-                    "account",
-                    "demo",
-                ),
-            )
-        )
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A {active_account} trade is already active. "
-                "Wait for it to finish before switching "
-                "accounts or starting another trade."
-            ),
-        )
-
-    # Select the account before execution so every operation
-    # below uses exactly the account requested by the UI.
+    # Switching account resets only the currently
+    # selected account's trading configuration.
     session[
         "account"
     ] = account
@@ -6366,6 +6361,10 @@ async def start_trading(
     ] = duration
 
     session[
+        "volatility_filter"
+    ] = normalize_volatility_filter(request.volatility_filter)
+
+    session[
         "real_market_mode"
     ] = (
         bool(
@@ -6375,6 +6374,7 @@ async def start_trading(
         else False
     )
 
+    # Keep compatibility field synchronized.
     session[
         "consecutive_losses"
     ] = get_consecutive_losses(
@@ -6386,48 +6386,13 @@ async def start_trading(
         "trading"
     ] = True
 
-    # START TRADING immediately executes the current fresh
-    # prediction. It no longer only flips the trading flag.
-    # The result contains the actual Deriv contract/P&L data.
-    try:
-
-        result = await execute_current_prediction(
-            session[
-                "session_id"
-            ]
-        )
-
-    except Exception:
-
-        # Do not leave the UI in a false "Trading" state when
-        # the first execution failed before a contract opened.
-        if not session.get(
-            "active_trade"
-        ):
-            session[
-                "trading"
-            ] = False
-
-        raise
-
-    selected_stats = session.get(
-        "demo_stats"
-        if account == "demo"
-        else "real_stats",
-        new_stats(),
-    )
-
-    trades_count = int(
-        selected_stats.get(
-            "trades",
-            0,
-        )
-    )
-
-    wins_count = int(
-        selected_stats.get(
-            "wins",
-            0,
+    # Start the first real/demo trade immediately after the
+    # start request succeeds. The existing execution path
+    # continues to handle proposal, buy, monitoring, P/L,
+    # statistics, history, and balance refresh.
+    asyncio.create_task(
+        execute_current_prediction(
+            session["session_id"]
         )
     )
 
@@ -6435,77 +6400,22 @@ async def start_trading(
         "status": "ok",
 
         "message": (
-            f"{account.capitalize()} trading started "
-            "and the first trade was executed."
+            f"{account.capitalize()} trading started."
         ),
 
-        "trading": bool(
-            session.get(
-                "trading",
-                False,
-            )
-        ),
+        "trading": True,
 
         "account": account,
-
-        "account_id": session[
-            "accounts"
-        ].get(
-            account
-        ),
 
         "stake": stake,
 
         "duration": duration,
 
+        "volatility_filter": session["volatility_filter"],
+
         "real_market_mode": session[
             "real_market_mode"
         ],
-
-        "result": result.get(
-            "result",
-            result,
-        ),
-
-        "prediction": result.get(
-            "prediction"
-        ),
-
-        "balance": session[
-            "balances"
-        ].get(
-            account
-        ),
-
-        "stats": {
-            "profit": round(
-                float(
-                    selected_stats.get(
-                        "profit",
-                        0.0,
-                    )
-                ),
-                2,
-            ),
-            "trades": trades_count,
-            "wins": wins_count,
-            "losses": int(
-                selected_stats.get(
-                    "losses",
-                    0,
-                )
-            ),
-            "win_rate": round(
-                wins_count / trades_count * 100
-                if trades_count
-                else 0.0,
-                2,
-            ),
-        },
-
-        "active_trade": session.get(
-            "active_trade"
-        ),
 
         "consecutive_losses": (
             get_consecutive_losses(
@@ -6535,44 +6445,9 @@ async def stop_trading(
         request.account
     )
 
-    # Only stop the account currently selected by this session.
-    # A stale Demo/Real UI request must not alter the other mode.
-    selected_account = normalize_account_type(
-        session.get(
-            "account",
-            "demo",
-        )
-    )
-
-    if account != selected_account:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"The session is currently using the "
-                f"{selected_account} account. "
-                f"{account.capitalize()} trading was not changed."
-            ),
-        )
-
     session[
         "trading"
     ] = False
-
-    active_trade = session.get(
-        "active_trade"
-    )
-
-    if (
-        active_trade
-        and normalize_account_type(
-            active_trade.get(
-                "account",
-                account,
-            )
-        ) != account
-    ):
-        active_trade = None
 
     return {
         "status": "ok",
@@ -6581,7 +6456,14 @@ async def stop_trading(
 
         "account": account,
 
-        "active_trade": active_trade,
+        "active_trade": (
+            session.get("active_trade")
+            if (
+                session.get("active_trade") is None
+                or session.get("active_trade", {}).get("account") == account
+            )
+            else None
+        ),
 
         "message": (
             f"{account.capitalize()} trading stopped. "
@@ -6801,23 +6683,23 @@ async def execute_current_prediction(
             ),
         )
 
-    if session.get(
-        "active_trade"
-    ):
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "A trade is already active."
-            ),
-        )
-
     account = normalize_account_type(
         session.get(
             "account",
             "demo",
         )
     )
+
+    if (
+        session.get("active_trade")
+        and session.get("active_trade", {}).get("account") == account
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A trade is already active for this account."
+            ),
+        )
 
     account_losses = (
         get_consecutive_losses(
@@ -6907,6 +6789,7 @@ async def execute_current_prediction(
         await analyze_live_markets(
             DEFAULT_BARRIER,
             force_fresh=True,
+            volatility_filter=session.get("volatility_filter", "all"),
         )
     )
 
@@ -7023,27 +6906,6 @@ async def execute_current_prediction(
             DEFAULT_BARRIER,
         )
 
-    selected_stats = session.get(
-        "demo_stats"
-        if account == "demo"
-        else "real_stats",
-        new_stats(),
-    )
-
-    trades_count = int(
-        selected_stats.get(
-            "trades",
-            0,
-        )
-    )
-
-    wins_count = int(
-        selected_stats.get(
-            "wins",
-            0,
-        )
-    )
-
     return {
         "status": "ok",
 
@@ -7057,38 +6919,6 @@ async def execute_current_prediction(
         "prediction": prediction,
 
         "result": result,
-
-        "balance": session[
-            "balances"
-        ].get(
-            account
-        ),
-
-        "stats": {
-            "profit": round(
-                float(
-                    selected_stats.get(
-                        "profit",
-                        0.0,
-                    )
-                ),
-                2,
-            ),
-            "trades": trades_count,
-            "wins": wins_count,
-            "losses": int(
-                selected_stats.get(
-                    "losses",
-                    0,
-                )
-            ),
-            "win_rate": round(
-                wins_count / trades_count * 100
-                if trades_count
-                else 0.0,
-                2,
-            ),
-        },
     }
 
 
